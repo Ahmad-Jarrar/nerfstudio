@@ -34,6 +34,8 @@ from nerfstudio.data.utils.colmap_parsing_utils import (
     qvec2rotmat,
     read_cameras_binary,
     read_images_binary,
+    read_cameras_text,
+    read_images_text,
     read_points3D_binary,
     read_points3D_text,
 )
@@ -397,7 +399,7 @@ def colmap_to_json(
     keep_original_world_coordinate: bool = False,
     use_single_camera_mode: bool = True,
 ) -> int:
-    """Converts COLMAP's cameras.bin and images.bin to a JSON file.
+    """Converts COLMAP's cameras.bin and images.bin or cameras.txt and images.txt to a JSON file.
 
     Args:
         recon_dir: Path to the reconstruction directory, e.g. "sparse/0"
@@ -417,8 +419,13 @@ def colmap_to_json(
     # recon = pycolmap.Reconstruction(recon_dir)
     # cam_id_to_camera = recon.cameras
     # im_id_to_image = recon.images
-    cam_id_to_camera = read_cameras_binary(recon_dir / "cameras.bin")
-    im_id_to_image = read_images_binary(recon_dir / "images.bin")
+    try:
+        cam_id_to_camera = read_cameras_binary(recon_dir / "cameras.bin")
+        im_id_to_image = read_images_binary(recon_dir / "images.bin")
+    except:
+        cam_id_to_camera = read_cameras_text(recon_dir / "cameras.txt")
+        im_id_to_image = read_images_text(recon_dir / "images.txt")
+
     if set(cam_id_to_camera.keys()) != {1}:
         CONSOLE.print(f"[bold yellow]Warning: More than one camera is found in {recon_dir}")
         print(cam_id_to_camera)

@@ -123,7 +123,7 @@ class ImagesToNerfstudioDataset(ColmapConverterToNerfstudioDataset):
         summary_log += log_tmp
 
         if require_cameras_exist and not (self.absolute_colmap_model_path / "cameras.bin").exists():
-            raise RuntimeError(f"Could not find existing COLMAP results ({self.colmap_model_path / 'cameras.bin'}).")
+            raise RuntimeError(f"Could not find existing COLMAP results ({self.colmap_model_path / 'cameras.bin'}). Need to change!!!")
 
         summary_log += self._save_transforms(
             num_frames,

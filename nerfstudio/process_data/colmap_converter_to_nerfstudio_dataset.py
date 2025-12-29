@@ -131,7 +131,7 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
             image_rename_map: Use these image names instead of the names embedded in the COLMAP db
         """
         summary_log = []
-        if (self.absolute_colmap_model_path / "cameras.bin").exists():
+        if (self.absolute_colmap_model_path / "cameras.bin").exists() or (self.absolute_colmap_model_path / "cameras.txt").exists():
             with CONSOLE.status("[bold yellow]Saving results to transforms.json", spinner="balloon"):
                 num_matched_frames = colmap_utils.colmap_to_json(
                     recon_dir=self.absolute_colmap_model_path,

@@ -25,6 +25,9 @@ from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 import torch
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 
+
+from nerfstudio.model_components.gsplat_strategies import CustomStrategy
+
 try:
     from gsplat.rendering import rasterization
 except ImportError:
@@ -156,7 +159,7 @@ class SplatfactoModelConfig(ModelConfig):
     """Shape of the bilateral grid (X, Y, W)"""
     color_corrected_metrics: bool = False
     """If True, apply color correction to the rendered images before computing the metrics."""
-    strategy: Literal["default", "mcmc"] = "default"
+    strategy: Literal["default", "mcmc", "custom"] = "default"
     """The default strategy will be used if strategy is not specified. Other strategies, e.g. mcmc, can be used."""
     max_gs_num: int = 1_000_000
     """Maximum number of GSs. Default to 1_000_000."""
@@ -166,6 +169,8 @@ class SplatfactoModelConfig(ModelConfig):
     """Regularization term for opacity in MCMC strategy. Only enabled when using MCMC strategy"""
     mcmc_scale_reg: float = 0.01
     """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
+    use_uniform_scale: bool = False
+    """If True, use a 1D scalar scale that is duplicated 3 times to ensure spherical Gaussians. If False, use 3D scales allowing anisotropic Gaussians."""
 
 
 class SplatfactoModel(Model):
@@ -194,9 +199,22 @@ class SplatfactoModel(Model):
         distances, _ = k_nearest_sklearn(means.data, 3)
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
-        scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
+        if self.config.use_uniform_scale:
+            # Store as 1D scalar for spherical Gaussians
+            scales = torch.nn.Parameter(torch.log(avg_dist))
+        else:
+            # Store as 3D vector for anisotropic Gaussians
+            scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
         num_points = means.shape[0]
-        quats = torch.nn.Parameter(random_quat_tensor(num_points))
+        if self.config.use_uniform_scale:
+            # For spherical Gaussians, rotation doesn't matter - use identity quaternion [1, 0, 0, 0]
+            # Store as non-trainable parameter since it won't be optimized
+            quats = torch.nn.Parameter(
+                torch.tensor([1.0, 0.0, 0.0, 0.0], device=means.device).unsqueeze(0).repeat(num_points, 1),
+                requires_grad=False
+            )
+        else:
+            quats = torch.nn.Parameter(random_quat_tensor(num_points))
         dim_sh = num_sh_bases(self.config.sh_degree)
 
         if (
@@ -290,6 +308,14 @@ class SplatfactoModel(Model):
                 verbose=False,
             )
             self.strategy_state = self.strategy.initialize_state()
+
+        elif self.config.strategy == "custom":
+            self.strategy = CustomStrategy(
+                refine_start_iter=self.config.warmup_length,
+                refine_stop_iter=self.config.stop_split_at,
+                refine_every=self.config.refine_every,
+            )
+            self.strategy_state = self.strategy.initialize_state()
         else:
             raise ValueError(f"""Splatfacto does not support strategy {self.config.strategy}
                              Currently, the supported strategies include default and mcmc.""")
@@ -322,11 +348,23 @@ class SplatfactoModel(Model):
 
     @property
     def scales(self):
-        return self.gauss_params["scales"]
+        if self.config.use_uniform_scale:
+            # Expand 1D scalar to 3D vector to ensure spherical Gaussians
+            return self.gauss_params["scales"].repeat(1, 3)
+        else:
+            # Return 3D scales as-is for anisotropic Gaussians
+            return self.gauss_params["scales"]
 
     @property
     def quats(self):
-        return self.gauss_params["quats"]
+        if self.config.use_uniform_scale:
+            # For spherical Gaussians, return fixed identity quaternion [1, 0, 0, 0]
+            # This ensures no rotation is applied (rotation has no effect on spheres)
+            num_points = self.gauss_params["quats"].shape[0]
+            device = self.gauss_params["quats"].device
+            return torch.tensor([1.0, 0.0, 0.0, 0.0], device=device).unsqueeze(0).repeat(num_points, 1)
+        else:
+            return self.gauss_params["quats"]
 
     @property
     def features_dc(self):
@@ -382,6 +420,15 @@ class SplatfactoModel(Model):
                 info=self.info,
                 lr=self.schedulers["means"].get_last_lr()[0],  # the learning rate for the "means" attribute of the GS
             )
+        elif isinstance(self.strategy, CustomStrategy):
+            self.strategy.step_post_backward(
+                params=self.gauss_params,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=self.step,
+                info=self.info,
+                packed=False,
+            )
         else:
             raise ValueError(f"Unknown strategy {self.strategy}")
 
@@ -412,9 +459,13 @@ class SplatfactoModel(Model):
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
         # specify more if they want to add more optimizable params to gaussians.
+        param_names = ["means", "scales", "features_dc", "features_rest", "opacities"]
+        # Exclude quats from optimization when using uniform scale (rotation doesn't matter for spheres)
+        if not self.config.use_uniform_scale:
+            param_names.append("quats")
         return {
             name: [self.gauss_params[name]]
-            for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+            for name in param_names
         }
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
@@ -572,6 +623,8 @@ class SplatfactoModel(Model):
             rasterize_mode=self.config.rasterize_mode,
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
+            with_ut=True,
+            with_eval3d=True,
         )
         if self.training:
             self.strategy.step_pre_backward(
@@ -698,7 +751,9 @@ class SplatfactoModel(Model):
                 )
                 loss_dict["mcmc_opacity_reg"] = mcmc_opacity_reg
             if self.config.mcmc_scale_reg > 0.0:
-                mcmc_scale_reg = self.config.mcmc_scale_reg * torch.abs(torch.exp(self.gauss_params["scales"])).mean()
+                # Use scales property which handles uniform vs 3D scales
+                scales_for_reg = self.scales
+                mcmc_scale_reg = self.config.mcmc_scale_reg * torch.abs(torch.exp(scales_for_reg)).mean()
                 loss_dict["mcmc_scale_reg"] = mcmc_scale_reg
 
         if self.training:

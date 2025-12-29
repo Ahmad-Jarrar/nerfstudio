@@ -49,6 +49,8 @@ from nerfstudio.data.utils.dataloaders import ImageBatchStream, _undistort_image
 from nerfstudio.utils.misc import get_dict_to_torch, get_orig_class
 from nerfstudio.utils.rich_utils import CONSOLE
 
+from PIL import Image
+
 
 @dataclass
 class FullImageDatamanagerConfig(DataManagerConfig):
@@ -148,6 +150,24 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
         assert len(self.train_unseen_cameras) > 0, "No data found in dataset"
         super().__init__()
+
+        # # debug images
+        # CONSOLE.print("Saving debug images", style="bold yellow")
+        # for i in range(10):
+
+        #     cam, data = self.next_train(i)
+
+        #     img = data["image"]
+
+        #     CONSOLE.print(img.size(), style="bold yellow")
+        #     # Convert to uint8 numpy
+        #     img_np = img.cpu().numpy()  # HWC float 0–1
+        #     # img_np = img_np[:, :, ::-1]   # BGR → RGB
+        #     # img_np = (img_np * 255).astype("uint8")
+
+        #     # Create Pillow image and save
+        #     im = Image.fromarray(img_np)
+        #     im.save(f"debug_img_{i}.png")
 
     def sample_train_cameras(self):
         """Return a list of camera indices sampled using the strategy specified by
