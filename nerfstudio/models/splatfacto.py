@@ -171,6 +171,9 @@ class SplatfactoModelConfig(ModelConfig):
     """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
     use_uniform_scale: bool = False
     """If True, use a 1D scalar scale that is duplicated 3 times to ensure spherical Gaussians. If False, use 3D scales allowing anisotropic Gaussians."""
+    freeze_means: bool = False
+    """If True, freeze the means (positions) parameters so that 3D points do not move from their original positions.
+    Only other parameters (colors, opacities, scales, rotations) will be optimized."""
 
 
 class SplatfactoModel(Model):
@@ -189,13 +192,17 @@ class SplatfactoModel(Model):
         **kwargs,
     ):
         self.seed_points = seed_points
+        self._logged_distortion = False  # Flag to log distortion info only once
         super().__init__(*args, **kwargs)
 
     def populate_modules(self):
         if self.seed_points is not None and not self.config.random_init:
-            means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
+            means = torch.nn.Parameter(self.seed_points[0], requires_grad=not self.config.freeze_means)  # (Location, Color)
         else:
-            means = torch.nn.Parameter((torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale)
+            means = torch.nn.Parameter(
+                (torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale,
+                requires_grad=not self.config.freeze_means
+            )
         distances, _ = k_nearest_sklearn(means.data, 3)
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
@@ -247,6 +254,10 @@ class SplatfactoModel(Model):
                 "opacities": opacities,
             }
         )
+        
+        # Log if means are frozen
+        if self.config.freeze_means:
+            CONSOLE.log(f"[yellow]Means (positions) are frozen - 3D points will not move during optimization")
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
@@ -412,13 +423,22 @@ class SplatfactoModel(Model):
                 packed=False,
             )
         elif isinstance(self.strategy, MCMCStrategy):
+            # Get learning rate for means if means are not frozen, otherwise use a default value
+            if not self.config.freeze_means and "means" in self.schedulers and self.schedulers["means"] is not None:
+                lr = self.schedulers["means"].get_last_lr()[0]
+            elif "scales" in self.schedulers and self.schedulers["scales"] is not None:
+                # Use learning rate from scales as fallback when means are frozen
+                lr = self.schedulers["scales"].get_last_lr()[0]
+            else:
+                # Default fallback learning rate
+                lr = 1e-4
             self.strategy.step_post_backward(
                 params=self.gauss_params,
                 optimizers=self.optimizers,
                 state=self.strategy_state,
                 step=step,
                 info=self.info,
-                lr=self.schedulers["means"].get_last_lr()[0],  # the learning rate for the "means" attribute of the GS
+                lr=lr,  # the learning rate for the "means" attribute of the GS (or fallback when frozen)
             )
         elif isinstance(self.strategy, CustomStrategy):
             self.strategy.step_post_backward(
@@ -459,7 +479,10 @@ class SplatfactoModel(Model):
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
         # specify more if they want to add more optimizable params to gaussians.
-        param_names = ["means", "scales", "features_dc", "features_rest", "opacities"]
+        param_names = ["scales", "features_dc", "features_rest", "opacities"]
+        # Exclude means from optimization when frozen
+        if not self.config.freeze_means:
+            param_names.insert(0, "means")  # Add means at the beginning if not frozen
         # Exclude quats from optimization when using uniform scale (rotation doesn't matter for spheres)
         if not self.config.use_uniform_scale:
             param_names.append("quats")
@@ -588,6 +611,49 @@ class SplatfactoModel(Model):
         self.last_size = (H, W)
         camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
+        # Extract distortion parameters from camera metadata if available
+        # Only use distortion parameters if strategy is NOT default (default strategy doesn't support distortion)
+        radial = None
+        tangential = None
+        thin_prism = None
+        use_distortion = not isinstance(self.strategy, DefaultStrategy)
+        
+        if use_distortion and camera.metadata is not None:
+            if "distortion_radial" in camera.metadata:
+                radial = camera.metadata["distortion_radial"].cuda()
+            if "distortion_tangential" in camera.metadata:
+                tangential = camera.metadata["distortion_tangential"].cuda()
+            if "distortion_thin_prism" in camera.metadata:
+                thin_prism = camera.metadata["distortion_thin_prism"].cuda()
+        
+        # Log distortion parameters being used for rasterization (only once)
+        if use_distortion and not self._logged_distortion and (radial is not None or tangential is not None or thin_prism is not None):
+            from nerfstudio.utils.rich_utils import CONSOLE
+            from nerfstudio.cameras.cameras import CameraType
+            camera_type_val = camera.camera_type.item() if hasattr(camera.camera_type, 'item') else camera.camera_type
+            try:
+                camera_type_enum = CameraType(camera_type_val)
+                camera_type_name = camera_type_enum.name
+            except (ValueError, TypeError):
+                camera_type_name = str(camera_type_val)
+            strategy_name = type(self.strategy).__name__
+            CONSOLE.log(f"[cyan]Rasterization with distortion (strategy: {strategy_name}) - Camera type: {camera_type_name}")
+            if radial is not None:
+                radial_vals = radial[0].cpu().tolist() if radial.numel() > 0 else []
+                CONSOLE.log(f"[cyan]  Radial: {radial_vals}")
+            if tangential is not None:
+                tangential_vals = tangential[0].cpu().tolist() if tangential.numel() > 0 else []
+                CONSOLE.log(f"[cyan]  Tangential: {tangential_vals}")
+            if thin_prism is not None and thin_prism.shape[-1] > 0:
+                thin_prism_vals = thin_prism[0].cpu().tolist()
+                CONSOLE.log(f"[cyan]  Thin prism: {thin_prism_vals}")
+            self._logged_distortion = True
+        elif not use_distortion and not self._logged_distortion:
+            # Log that we're using default strategy without distortion
+            from nerfstudio.utils.rich_utils import CONSOLE
+            CONSOLE.log(f"[yellow]Using default strategy - distortion parameters disabled (not supported by DefaultStrategy)")
+            self._logged_distortion = True
+
         # apply the compensation of screen space blurring to gaussians
         if self.config.rasterize_mode not in ["antialiased", "classic"]:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
@@ -603,29 +669,42 @@ class SplatfactoModel(Model):
             colors_crop = torch.sigmoid(colors_crop).squeeze(1)  # [N, 1, 3] -> [N, 3]
             sh_degree_to_use = None
 
-        render, alpha, self.info = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
-            means=means_crop,
-            quats=quats_crop,  # rasterization does normalization internally
-            scales=torch.exp(scales_crop),
-            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
-            colors=colors_crop,
-            viewmats=viewmat,  # [1, 4, 4]
-            Ks=K,  # [1, 3, 3]
-            width=W,
-            height=H,
-            packed=False,
-            near_plane=0.01,
-            far_plane=1e10,
-            render_mode=render_mode,
-            sh_degree=sh_degree_to_use,
-            sparse_grad=False,
-            absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
-            rasterize_mode=self.config.rasterize_mode,
+        # Prepare rasterization kwargs
+        rasterization_kwargs = {
+            "means": means_crop,
+            "quats": quats_crop,  # rasterization does normalization internally
+            "scales": torch.exp(scales_crop),
+            "opacities": torch.sigmoid(opacities_crop).squeeze(-1),
+            "colors": colors_crop,
+            "viewmats": viewmat,  # [1, 4, 4]
+            "Ks": K,  # [1, 3, 3]
+            "width": W,
+            "height": H,
+            "packed": False,
+            "near_plane": 0.01,
+            "far_plane": 1e10,
+            "render_mode": render_mode,
+            "sh_degree": sh_degree_to_use,
+            "sparse_grad": False,
+            "absgrad": self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
+            "rasterize_mode": self.config.rasterize_mode,
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
-            with_ut=True,
-            with_eval3d=True,
-        )
+            "with_ut": True,
+            "with_eval3d": True,
+        }
+        
+        # Add distortion parameters if available and strategy supports them (not default strategy)
+        # Only pass distortion parameters if use_distortion is True (strategy is not DefaultStrategy)
+        if use_distortion:
+            if radial is not None:
+                rasterization_kwargs["radial"] = radial
+            if tangential is not None:
+                rasterization_kwargs["tangential"] = tangential
+            if thin_prism is not None:
+                rasterization_kwargs["thin_prism"] = thin_prism
+
+        render, alpha, self.info = rasterization(**rasterization_kwargs)  # type: ignore[reportPossiblyUnboundVariable]
         if self.training:
             self.strategy.step_pre_backward(
                 self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info

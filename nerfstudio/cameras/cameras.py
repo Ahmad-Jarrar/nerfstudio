@@ -1010,6 +1010,12 @@ class Cameras(TensorDataclass):
         self.fy = self.fy * scaling_factor
         self.cx = self.cx * scaling_factor
         self.cy = self.cy * scaling_factor
+        
+        # Note: Distortion parameters (radial, tangential, thin_prism) in metadata are in normalized coordinates
+        # (relative to focal length), not pixel coordinates. When coordinates are normalized by dividing by fx/fy,
+        # the distortion parameters remain valid regardless of image resolution. Therefore, they do NOT need to be
+        # scaled when downsampling. The distortion parameters are resolution-independent.
+        
         if scale_rounding_mode == "floor":
             self.height = (self.height * scaling_factor).to(torch.int64)
             self.width = (self.width * scaling_factor).to(torch.int64)

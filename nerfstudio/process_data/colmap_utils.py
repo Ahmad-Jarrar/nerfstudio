@@ -389,6 +389,182 @@ def parse_colmap_camera_params(camera) -> Dict[str, Any]:
     return out
 
 
+def parse_colmap_camera_params_with_distortion(camera) -> Dict[str, Any]:
+    """
+    Parses all currently supported COLMAP cameras into the transforms.json metadata
+    with structured distortion coefficients (radial, tangential, thin_prism as separate vectors).
+
+    Args:
+        camera: COLMAP camera
+    Returns:
+        transforms.json metadata containing camera's intrinsics and structured distortion parameters
+    """
+    out: Dict[str, Any] = {
+        "w": camera.width,
+        "h": camera.height,
+    }
+
+    # Parameters match https://github.com/colmap/colmap/blob/dev/src/base/camera_models.h
+    camera_params = camera.params
+    camera_model_str: Optional[str] = None
+    camera_model: Optional[CameraModel] = None
+    if camera.model == "SIMPLE_PINHOLE":
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[0])
+        out["cx"] = float(camera_params[1])
+        out["cy"] = float(camera_params[2])
+        radial = [0.0]
+        tangential = [0.0, 0.0]
+        thin_prism = []
+        camera_model = CameraModel.OPENCV
+    elif camera.model == "PINHOLE":
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[1])
+        out["cx"] = float(camera_params[2])
+        out["cy"] = float(camera_params[3])
+        radial = [0.0]
+        tangential = [0.0, 0.0]
+        thin_prism = []
+        camera_model = CameraModel.OPENCV
+    elif camera.model == "SIMPLE_RADIAL":
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[0])
+        out["cx"] = float(camera_params[1])
+        out["cy"] = float(camera_params[2])
+        radial = [float(camera_params[3])]
+        tangential = [0.0, 0.0]
+        thin_prism = []
+        camera_model = CameraModel.OPENCV
+    elif camera.model == "RADIAL":
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[0])
+        out["cx"] = float(camera_params[1])
+        out["cy"] = float(camera_params[2])
+        radial = [float(camera_params[3]), float(camera_params[4])]
+        tangential = [0.0, 0.0]
+        thin_prism = []
+        camera_model = CameraModel.OPENCV
+    elif camera.model == "OPENCV":
+        # fx, fy, cx, cy, k1, k2, p1, p2
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[1])
+        out["cx"] = float(camera_params[2])
+        out["cy"] = float(camera_params[3])
+        # For OPENCV: k1, k2 are radial, p1, p2 are tangential
+        # Note: OPENCV model uses k1, k2 for radial (no k3), but we store k3=0 for consistency
+        radial = [float(camera_params[4]), float(camera_params[5]), 0.0]
+        tangential = [float(camera_params[6]), float(camera_params[7])]
+        thin_prism = []
+        camera_model = CameraModel.OPENCV
+    elif camera.model == "OPENCV_FISHEYE":
+        # fx, fy, cx, cy, k1, k2, k3, k4
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[1])
+        out["cx"] = float(camera_params[2])
+        out["cy"] = float(camera_params[3])
+        radial = [float(camera_params[4]), float(camera_params[5]), float(camera_params[6]), float(camera_params[7])]
+        tangential = []
+        thin_prism = []
+        camera_model = CameraModel.OPENCV_FISHEYE
+    elif camera.model == "FULL_OPENCV":
+        # fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, k5, k6
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[1])
+        out["cx"] = float(camera_params[2])
+        out["cy"] = float(camera_params[3])
+        radial = [float(camera_params[4]), float(camera_params[5]), float(camera_params[8]), 
+                  float(camera_params[9]), float(camera_params[10]), float(camera_params[11])]
+        tangential = [float(camera_params[6]), float(camera_params[7])]
+        thin_prism = []
+        raise NotImplementedError(f"{camera.model} camera model is not supported yet!")
+    elif camera.model == "FOV":
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[1])
+        out["cx"] = float(camera_params[2])
+        out["cy"] = float(camera_params[3])
+        out["omega"] = float(camera_params[4])
+        radial = []
+        tangential = []
+        thin_prism = []
+        raise NotImplementedError(f"{camera.model} camera model is not supported yet!")
+    elif camera.model == "SIMPLE_RADIAL_FISHEYE":
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[0])
+        out["cx"] = float(camera_params[1])
+        out["cy"] = float(camera_params[2])
+        radial = [float(camera_params[3]), 0.0, 0.0, 0.0]
+        tangential = []
+        thin_prism = []
+        camera_model = CameraModel.OPENCV_FISHEYE
+    elif camera.model == "RADIAL_FISHEYE":
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[0])
+        out["cx"] = float(camera_params[1])
+        out["cy"] = float(camera_params[2])
+        radial = [float(camera_params[3]), float(camera_params[4]), 0.0, 0.0]
+        tangential = []
+        thin_prism = []
+        camera_model = CameraModel.OPENCV_FISHEYE
+    elif camera.model == "THIN_PRISM_FISHEYE":
+        # THIN_PRISM_FISHEYE: fx, fy, cx, cy, k0, k1, k2, k3, p0, p1, s0, s1
+        # Note: COLMAP's THIN_PRISM_FISHEYE has 12 params, but FISHEYE624 uses 16
+        # We'll map what we can: [fx, fy, cx, cy, k0, k1, k2, k3, p0, p1, s0, s1]
+        out["fl_x"] = float(camera_params[0])
+        out["fl_y"] = float(camera_params[1])
+        out["cx"] = float(camera_params[2])
+        out["cy"] = float(camera_params[3])
+        # k0, k1, k2, k3 are radial (COLMAP has 4, FISHEYE624 uses 6, so we pad with zeros)
+        radial = [float(camera_params[4]), float(camera_params[5]), float(camera_params[6]), 
+                  float(camera_params[7]), 0.0, 0.0]
+        # p0, p1 are tangential
+        tangential = [float(camera_params[8]), float(camera_params[9])]
+        # s0, s1 are thin prism (COLMAP has 2, FISHEYE624 uses 4, so we pad with zeros)
+        thin_prism = [float(camera_params[10]), float(camera_params[11]), 0.0, 0.0]
+        # Use FISHEYE624 as the camera model string (it's mapped to CameraType.FISHEYE624 in cameras.py)
+        camera_model_str = "FISHEYE624"
+        camera_model = None  # Will be handled separately
+    else:
+        raise NotImplementedError(f"{camera.model} camera model is not supported yet!")
+
+    # Handle FISHEYE624 as a string, other models use .value
+    if camera_model_str is not None:
+        out["camera_model"] = camera_model_str
+    elif camera_model is not None:
+        out["camera_model"] = camera_model.value
+    else:
+        raise ValueError(f"Camera model not properly initialized for {camera.model}")
+    
+    # Add intrinsic matrix
+    K = np.array([
+        [out["fl_x"], 0.0, out["cx"]],
+        [0.0, out["fl_y"], out["cy"]],
+        [0.0, 0.0, 1.0]
+    ])
+    out["intrinsic_matrix"] = K.tolist()
+    
+    # Add structured distortion coefficients
+    out["distortion"] = {
+        "radial": radial if radial else None,
+        "tangential": tangential if tangential else None,
+        "thin_prism": thin_prism if thin_prism else None,
+    }
+    
+    # Also keep the old format for backward compatibility
+    if camera.model == "OPENCV":
+        out["k1"] = radial[0] if len(radial) > 0 else 0.0
+        out["k2"] = radial[1] if len(radial) > 1 else 0.0
+        out["k3"] = radial[2] if len(radial) > 2 else 0.0
+        out["p1"] = tangential[0] if len(tangential) > 0 else 0.0
+        out["p2"] = tangential[1] if len(tangential) > 1 else 0.0
+    elif camera.model in ["OPENCV_FISHEYE", "SIMPLE_RADIAL_FISHEYE", "RADIAL_FISHEYE"]:
+        out["k1"] = radial[0] if len(radial) > 0 else 0.0
+        out["k2"] = radial[1] if len(radial) > 1 else 0.0
+        out["k3"] = radial[2] if len(radial) > 2 else 0.0
+        out["k4"] = radial[3] if len(radial) > 3 else 0.0
+    
+    return out
+
+
 def colmap_to_json(
     recon_dir: Path,
     output_dir: Path,

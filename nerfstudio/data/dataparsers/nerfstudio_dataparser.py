@@ -292,11 +292,84 @@ class Nerfstudio(DataParser):
         else:
             distortion_params = torch.stack(distort, dim=0)[idx_tensor]
 
+        # Parse distortion parameters into separate vectors for rasterization
+        # For OpenCV: distortion_params = [k1, k2, k3, k4, p1, p2]
+        # Radial: k1, k2, k3 (k4 is typically 0 for OpenCV)
+        # Tangential: p1, p2
+        # Thin prism: empty for OpenCV (only for FISHEYE624)
+        radial = None
+        tangential = None
+        thin_prism = None
+        
+        if distortion_params is not None and distortion_params.numel() > 0:
+            # Ensure distortion_params has the right shape
+            if distortion_params.dim() == 1:
+                distortion_params = distortion_params.unsqueeze(0)
+            
+            if distortion_params.shape[-1] == 6:  # OpenCV format [k1, k2, k3, k4, p1, p2]
+                radial = distortion_params[..., :3]  # k1, k2, k3
+                tangential = distortion_params[..., 4:6]  # p1, p2
+                # Create empty thin_prism tensor with same batch shape
+                thin_prism = torch.zeros((*distortion_params.shape[:-1], 0), dtype=distortion_params.dtype, device=distortion_params.device)
+            elif distortion_params.shape[-1] == 12:  # FISHEYE624 format [k0...k5, p0, p1, s0...s3]
+                radial = distortion_params[..., :6]  # k0...k5
+                tangential = distortion_params[..., 6:8]  # p0, p1
+                thin_prism = distortion_params[..., 8:12]  # s0...s3
+            elif distortion_params.shape[-1] == 5:  # 5 OpenCV params [k1, k2, p1, p2, k3] (OpenCV order)
+                # OpenCV order: k1, k2, p1, p2, k3
+                radial = torch.stack([
+                    distortion_params[..., 0],  # k1
+                    distortion_params[..., 1],  # k2
+                    distortion_params[..., 4],  # k3
+                ], dim=-1)
+                tangential = distortion_params[..., 2:4]  # p1, p2
+                thin_prism = torch.zeros((*distortion_params.shape[:-1], 0), dtype=distortion_params.dtype, device=distortion_params.device)
+            else:
+                # Fallback: try to infer from available parameters
+                # Try to extract k1, k2, k3, p1, p2 from whatever is available
+                radial = torch.zeros((*distortion_params.shape[:-1], 3), dtype=distortion_params.dtype, device=distortion_params.device)
+                tangential = torch.zeros((*distortion_params.shape[:-1], 2), dtype=distortion_params.dtype, device=distortion_params.device)
+                thin_prism = torch.zeros((*distortion_params.shape[:-1], 0), dtype=distortion_params.dtype, device=distortion_params.device)
+                
+                if distortion_params.shape[-1] >= 1:
+                    radial[..., 0] = distortion_params[..., 0]  # k1
+                if distortion_params.shape[-1] >= 2:
+                    radial[..., 1] = distortion_params[..., 1]  # k2
+                if distortion_params.shape[-1] >= 3:
+                    radial[..., 2] = distortion_params[..., 2]  # k3 (or might be p1)
+                if distortion_params.shape[-1] >= 4:
+                    tangential[..., 0] = distortion_params[..., 3]  # p1
+                if distortion_params.shape[-1] >= 5:
+                    tangential[..., 1] = distortion_params[..., 4]  # p2
+
         # Only add fisheye crop radius parameter if the images are actually fisheye, to allow the same config to be used
         # for both fisheye and non-fisheye datasets.
         metadata = {}
         if (camera_type in [CameraType.FISHEYE, CameraType.FISHEYE624]) and (fisheye_crop_radius is not None):
             metadata["fisheye_crop_radius"] = fisheye_crop_radius
+        
+        # Store structured distortion parameters in metadata for rasterization
+        if radial is not None:
+            metadata["distortion_radial"] = radial
+        if tangential is not None:
+            metadata["distortion_tangential"] = tangential
+        if thin_prism is not None and thin_prism.shape[-1] > 0:
+            metadata["distortion_thin_prism"] = thin_prism
+        
+        # Log camera model and distortion parameters
+        camera_model_name = camera_type.name if isinstance(camera_type, CameraType) else str(camera_type)
+        CONSOLE.log(f"[green]Camera model: {camera_model_name}")
+        if radial is not None:
+            radial_str = ", ".join([f"{v:.6f}" for v in radial[0].tolist()]) if radial.numel() > 0 else "None"
+            CONSOLE.log(f"[green]  Radial distortion: [{radial_str}]")
+        if tangential is not None:
+            tangential_str = ", ".join([f"{v:.6f}" for v in tangential[0].tolist()]) if tangential.numel() > 0 else "None"
+            CONSOLE.log(f"[green]  Tangential distortion: [{tangential_str}]")
+        if thin_prism is not None and thin_prism.shape[-1] > 0:
+            thin_prism_str = ", ".join([f"{v:.6f}" for v in thin_prism[0].tolist()])
+            CONSOLE.log(f"[green]  Thin prism distortion: [{thin_prism_str}]")
+        elif radial is None and tangential is None:
+            CONSOLE.log(f"[green]  No distortion parameters")
 
         cameras = Cameras(
             fx=fx,

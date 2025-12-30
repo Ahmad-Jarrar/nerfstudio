@@ -92,6 +92,10 @@ class FullImageDatamanagerConfig(DataManagerConfig):
     More details are described here: https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader"""
     cache_compressed_images: bool = False
     """If True, cache raw image files as byte strings to RAM."""
+    keep_distorted_images: bool = False
+    """If True, keep original distorted images instead of undistorting them. 
+    This is useful when using distortion parameters in rasterization (e.g., with custom strategies).
+    Default is False to maintain backward compatibility with undistorted images."""
 
 
 class FullImageDatamanager(DataManager, Generic[TDataset]):
@@ -237,6 +241,13 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
                 f"The size of image ({data['image'].shape[1]}, {data['image'].shape[0]}) loaded "
                 f"does not match the camera parameters ({camera.width.item(), camera.height.item()})"
             )
+            
+            # Skip undistortion if configured to keep distorted images (for rasterization with distortion)
+            # This is only enabled when keep_distorted_images=True in config
+            if self.config.keep_distorted_images:
+                return data
+            
+            # Original undistortion logic for backward compatibility
             if camera.distortion_params is None or torch.all(camera.distortion_params == 0):
                 return data
             K = camera.get_intrinsics_matrices().numpy()
