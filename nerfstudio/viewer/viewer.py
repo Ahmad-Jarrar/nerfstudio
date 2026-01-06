@@ -87,6 +87,7 @@ class Viewer:
         self.config = config
         self.trainer = trainer
         self.last_step = 0
+        self.last_gaussian_points_update = -1000  # Initialize to allow first update
         self.train_lock = train_lock
         self.pipeline = pipeline
         self.log_filename = log_filename
@@ -280,10 +281,27 @@ class Viewer:
         # Diagnostics for Gaussian Splatting: where the points are at the start of training.
         # This is hidden by default, it can be shown from the Viser UI's scene tree table.
         if isinstance(pipeline.model, SplatfactoModel):
+            # Store initial means for comparison
+            with torch.no_grad():
+                initial_means = pipeline.model.means.data.clone().detach()
+                if initial_means.is_cuda:
+                    initial_means = initial_means.cpu()
+                initial_points = initial_means.numpy() * VISER_NERFSTUDIO_SCALE_RATIO
+            
             self.viser_server.scene.add_point_cloud(
                 "/gaussian_splatting_initial_points",
-                points=pipeline.model.means.numpy(force=True) * VISER_NERFSTUDIO_SCALE_RATIO,
+                points=initial_points,
                 colors=(255, 0, 0),
+                point_size=0.01,
+                point_shape="circle",
+                visible=False,  # Hidden by default.
+            )
+            # Current gaussian points (green circles) - will be updated during training
+            # Initialize with same points, but will be updated
+            self.viser_server.scene.add_point_cloud(
+                "/gaussian_splatting_current_points",
+                points=initial_points,  # Start with initial points, will be updated
+                colors=(0, 255, 0),
                 point_size=0.01,
                 point_shape="circle",
                 visible=False,  # Hidden by default.
@@ -526,6 +544,47 @@ class Viewer:
                         self.render_statemachines[id].action(RenderAction("step", camera_state))
                 self.update_camera_poses()
                 self.update_step(step)
+                # Update current gaussian points visualization (update less frequently to avoid performance issues)
+                # Update every 50 steps to be more responsive to changes
+                if isinstance(self.pipeline.model, SplatfactoModel) and step - self.last_gaussian_points_update >= 50:
+                    try:
+                        # Get current means - access directly from gauss_params to get actual current values
+                        model = self.pipeline.model
+                        assert isinstance(model, SplatfactoModel)
+                        
+                        # Check if means are frozen - if so, they won't change
+                        freeze_means = getattr(model.config, 'freeze_means', False)
+                        if freeze_means:
+                            # Means are frozen, so current points should match initial points
+                            # Skip update to avoid unnecessary work
+                            self.last_gaussian_points_update = step
+                        else:
+                            with torch.no_grad():
+                                # Access the parameter data directly - this gets the current optimized values
+                                # Use .clone() to ensure we get a fresh copy of the data
+                                current_means = model.gauss_params["means"].data.clone().detach()
+                                if current_means.is_cuda:
+                                    current_means = current_means.cpu()
+                                current_points = current_means.numpy() * VISER_NERFSTUDIO_SCALE_RATIO
+                                
+                                # Always update (remove change detection to ensure updates happen)
+                                # Remove and re-add to update (viser doesn't have direct update method)
+                                self.viser_server.scene.remove_point_cloud("/gaussian_splatting_current_points")
+                                self.viser_server.scene.add_point_cloud(
+                                    "/gaussian_splatting_current_points",
+                                    points=current_points,
+                                    colors=(0, 255, 0),
+                                    point_size=0.01,
+                                    point_shape="circle",
+                                    visible=False,  # Hidden by default.
+                                )
+                            self.last_gaussian_points_update = step
+                    except Exception as e:
+                        # Log error for debugging instead of silently failing
+                        from nerfstudio.utils.rich_utils import CONSOLE
+                        CONSOLE.log(f"[yellow]Failed to update gaussian points at step {step}: {e}")
+                        import traceback
+                        CONSOLE.log(f"[yellow]Traceback: {traceback.format_exc()}")
 
     def update_colormap_options(self, dimensions: int, dtype: type) -> None:
         """update the colormap options based on the current render
