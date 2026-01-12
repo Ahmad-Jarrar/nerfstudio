@@ -15,7 +15,7 @@
 """Control panel for the viewer"""
 
 from collections import defaultdict
-from typing import Callable, DefaultDict, List, Tuple, get_args
+from typing import Any, Callable, DefaultDict, Dict, List, Tuple, get_args, Optional
 
 import numpy as np
 import torch
@@ -57,12 +57,14 @@ class ControlPanel:
         update_output_cb: Callable,
         update_split_output_cb: Callable,
         default_composite_depth: bool = True,
+        viewer: Optional[Any] = None,
     ):
         self.viser_scale_ratio = scale_ratio
         # elements holds a mapping from tag: [elements]
         self.server = server
         self._elements_by_tag: DefaultDict[str, List[ViewerElement]] = defaultdict(lambda: [])
         self.default_composite_depth = default_composite_depth
+        self.viewer = viewer  # Reference to Viewer for selection mode
 
         self._train_speed = ViewerButtonGroup(
             name="Train Speed",
@@ -233,6 +235,31 @@ class ControlPanel:
             hint="Set the up direction of the camera orbit controls to the camera's current up direction.",
         )
         self._reset_camera.on_click(self._reset_camera_cb)
+        
+        # Selection mode controls
+        with self.server.gui.add_folder("Pixel Selection"):
+            self._selection_mode = ViewerCheckbox(
+                "Selection Mode",
+                False,
+                cb_hook=lambda _: self._selection_mode_cb(),
+                hint="Toggle between navigation mode and pixel selection mode",
+            )
+            self.add_element(self._selection_mode)
+            
+            # Reset button (always visible, but disabled when no selections)
+            self._reset_selection_button = self.server.gui.add_button(
+                label="Reset Selection",
+                icon=viser.Icon.TRASH,
+                color="red",
+                hint="Clear all selected pixels",
+            )
+            self._reset_selection_button.on_click(lambda _: self._reset_selection_cb())
+            self._reset_selection_button.disabled = True  # Disabled when no selections
+            
+            # Create a container for selection list items within the folder
+            # This will be updated dynamically but created here to maintain folder context
+            self._selection_list_container = self.server.gui.add_folder("Selected Pixels")
+            self._selection_list_items: Dict[int, Dict[str, Any]] = {}  # id -> {markdown, remove_button}
 
     def _train_speed_cb(self) -> None:
         pass
@@ -251,6 +278,144 @@ class ControlPanel:
     def _reset_camera_cb(self, _) -> None:
         for client in self.server.get_clients().values():
             client.camera.up_direction = vtf.SO3(client.camera.wxyz) @ np.array([0.0, -1.0, 0.0])
+    
+    def _selection_mode_cb(self) -> None:
+        """Callback when selection mode is toggled"""
+        if self.viewer is None:
+            return
+        self.viewer.set_selection_mode(self._selection_mode.value)
+        # Update selection list (always visible, regardless of mode)
+        self.update_selection_list()
+    
+    def update_selection_list(self) -> None:
+        """Update the selection list UI - always visible regardless of selection mode"""
+        if self.viewer is None:
+            return
+        
+        # Remove old list items (including empty state message)
+        for item_data in self._selection_list_items.values():
+            if "markdown" in item_data and item_data["markdown"] is not None:
+                try:
+                    item_data["markdown"].remove()
+                except Exception:
+                    pass  # Element may already be removed
+            if "toggle_button" in item_data and item_data["toggle_button"] is not None:
+                try:
+                    item_data["toggle_button"].remove()
+                except Exception:
+                    pass  # Element may already be removed
+            if "remove_button" in item_data and item_data["remove_button"] is not None:
+                try:
+                    item_data["remove_button"].remove()
+                except Exception:
+                    pass  # Element may already be removed
+        self._selection_list_items.clear()
+        
+        # Update reset button state based on whether there are selections
+        has_selections = len(self.viewer.selected_pixels) > 0
+        self._reset_selection_button.disabled = not has_selections
+        
+        # Add items within the container folder to maintain proper ordering
+        with self._selection_list_container:
+            # If no selections, show empty state message
+            if not has_selections:
+                empty_markdown = self.server.gui.add_markdown(
+                    "*No pixels selected. Enable Selection Mode and click on the rendered image to select pixels.*"
+                )
+                self._selection_list_items[-1] = {"markdown": empty_markdown}  # Use -1 as placeholder ID
+                return
+            
+            # Add items for each selection
+            for pixel_data in self.viewer.selected_pixels:
+                pixel_id = pixel_data["id"]
+                x = pixel_data["x"]
+                y = pixel_data["y"]
+                is_positive = pixel_data.get("is_positive", True)  # Default to True if not set
+                patch_data = pixel_data.get("patch_data", None)
+                
+                # Convert normalized coordinates to pixel coordinates
+                # We need image dimensions - for now use a reasonable default or get from render
+                # For display, we'll show normalized coordinates
+                x_display = f"{x:.4f}"
+                y_display = f"{y:.4f}"
+                
+                # Create compact display with coordinates
+                # Use the absolute simplest markdown - just plain text
+                coordinates_text = f"({x_display}, {y_display})"
+                
+                # Extract pixel color from the rendered image for text display
+                pixel_color_rgb = None
+                if self.viewer.last_rendered_image is not None:
+                    try:
+                        h, w = self.viewer.last_rendered_image.shape[:2]
+                        pixel_x = int(x * w)
+                        pixel_y = int(y * h)
+                        if 0 <= pixel_x < w and 0 <= pixel_y < h:
+                            color_rgb = self.viewer.last_rendered_image[pixel_y, pixel_x, :]
+                            pixel_color_rgb = (int(color_rgb[0]), int(color_rgb[1]), int(color_rgb[2]))
+                    except Exception:
+                        pass
+                
+                # Use the simplest possible markdown - just plain text, no formatting
+                if pixel_color_rgb:
+                    color_text = f"RGB({pixel_color_rgb[0]}, {pixel_color_rgb[1]}, {pixel_color_rgb[2]})"
+                    markdown_text = f"Pixel: {coordinates_text} - {color_text}"
+                else:
+                    markdown_text = f"Pixel: {coordinates_text}"
+                
+                # Create markdown - this should always work
+                # Don't catch exceptions here - let them propagate so we can see what's wrong
+                markdown = self.server.gui.add_markdown(markdown_text)
+                patch_markdown = None  # No longer using separate patch markdown
+                
+                # Create toggle button for positive/negative sign
+                # Use text label with appropriate color
+                toggle_btn = self.server.gui.add_button(
+                    label="+" if is_positive else "-",
+                    color="green" if is_positive else "red",
+                )
+                
+                def create_toggle_callback(pid: int):
+                    def toggle_cb(_):
+                        if self.viewer is not None:
+                            self.viewer.toggle_pixel_sign(pid)
+                            self.update_selection_list()
+                    return toggle_cb
+                
+                toggle_btn.on_click(create_toggle_callback(pixel_id))
+                
+                # Create remove button
+                remove_btn = self.server.gui.add_button(
+                    label="Remove",
+                    icon=viser.Icon.X,
+                    color="gray",
+                )
+                
+                def create_remove_callback(pid: int):
+                    def remove_cb(_):
+                        if self.viewer is not None:
+                            self.viewer.remove_selected_pixel(pid)
+                            self.update_selection_list()
+                    return remove_cb
+                
+                remove_btn.on_click(create_remove_callback(pixel_id))
+                
+                self._selection_list_items[pixel_id] = {
+                    "markdown": markdown,
+                    "toggle_button": toggle_btn,
+                    "remove_button": remove_btn,
+                }
+    
+    def _reset_selection_cb(self) -> None:
+        """Callback to reset all selections"""
+        if self.viewer is not None:
+            self.viewer.clear_selected_pixels()
+            self.update_selection_list()
+    
+    def initialize_selection_list(self) -> None:
+        """Initialize the selection list UI on startup"""
+        if self.viewer is not None:
+            self.update_selection_list()
 
     def update_output_options(self, new_options: List[str]):
         """

@@ -498,7 +498,9 @@ class CustomStrategy(Strategy):
         assert (
             self.key_for_gradient in info
         ), "The 2D means of the Gaussians is required but missing."
-        info[self.key_for_gradient].retain_grad()
+        # Only retain grad if the tensor requires gradients
+        if info[self.key_for_gradient].requires_grad:
+            info[self.key_for_gradient].retain_grad()
 
     def step_post_backward(
         self,
@@ -571,10 +573,21 @@ class CustomStrategy(Strategy):
             assert key in info, f"{key} is required but missing."
 
         # normalize grads to [-1, 1] screen space
-        if self.absgrad:
-            grads = info[self.key_for_gradient].absgrad.clone()
+        # Handle both cases: when info[key] is a dict-like object with absgrad/grad attributes,
+        # and when it's a Tensor directly (e.g., when using distortion with with_ut/with_eval3d)
+        gradient_info = info[self.key_for_gradient]
+        if isinstance(gradient_info, torch.Tensor):
+            # When using distortion/eval3d, gradient_info is already a Tensor
+            if self.absgrad:
+                grads = gradient_info.abs().clone()
+            else:
+                grads = gradient_info.clone()
         else:
-            grads = info[self.key_for_gradient].grad.clone()
+            # Normal case: gradient_info is a dict-like object with absgrad/grad attributes
+            if self.absgrad:
+                grads = gradient_info.absgrad.clone()
+            else:
+                grads = gradient_info.grad.clone()
         grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
         grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
 

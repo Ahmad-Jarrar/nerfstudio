@@ -63,6 +63,8 @@ class ViewerClick:
     """
     screen_pos: Tuple[float, float]
     """The screen position of the click in OpenCV screen coordinates, normalized to [0, 1]"""
+    button: Optional[str] = None
+    """The mouse button that was clicked ('left', 'right', 'middle', etc.)"""
 
 
 @dataclass
@@ -216,7 +218,14 @@ class ViewerControl:
                 )
                 origin = tuple([x / VISER_NERFSTUDIO_SCALE_RATIO for x in origin])
                 assert len(origin) == 3
-                pointer_event = ViewerClick(origin, direction, screen_pos)
+                # Try to get button info from the event if available
+                button = getattr(scene_pointer_msg, 'button', None)
+                if button is not None:
+                    # Convert button number to string if needed
+                    if isinstance(button, int):
+                        button_map = {0: "left", 1: "middle", 2: "right"}
+                        button = button_map.get(button, "unknown")
+                pointer_event = ViewerClick(origin, direction, screen_pos, button=button)
             elif scene_pointer_msg.event_type == "rect-select":
                 pointer_event = ViewerRectSelect(scene_pointer_msg.screen_pos[0], scene_pointer_msg.screen_pos[1])
             else:

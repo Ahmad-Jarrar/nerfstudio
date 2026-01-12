@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, List, Literal, Optional, Tuple, Type, Union
 
@@ -44,6 +44,29 @@ class CameraState:
     """The rendering time of the camera state."""
     idx: int = 0
     """The index of the current camera."""
+    fx: Optional[float] = None
+    """Optional focal length x. If None, computed from FOV."""
+    fy: Optional[float] = None
+    """Optional focal length y. If None, computed from FOV."""
+    cx: Optional[float] = None
+    """Optional principal point x. If None, computed from image center."""
+    cy: Optional[float] = None
+    """Optional principal point y. If None, computed from image center."""
+    # Radial distortion coefficients (k1-k6 for perspective, k1-k4 for fisheye)
+    k1: float = 0.0
+    k2: float = 0.0
+    k3: float = 0.0
+    k4: float = 0.0
+    k5: float = 0.0
+    k6: float = 0.0
+    # Tangential distortion coefficients (p1, p2)
+    p1: float = 0.0
+    p2: float = 0.0
+    # Thin prism distortion coefficients (s1-s4)
+    s1: float = 0.0
+    s2: float = 0.0
+    s3: float = 0.0
+    s4: float = 0.0
 
 
 def get_camera(
@@ -53,7 +76,8 @@ def get_camera(
 
     Args:
         camera_state: the camera state
-        image_size: the size of the image (height, width)
+        image_height: the height of the image
+        image_width: the width of the image (if None, computed from aspect ratio)
     """
     # intrinsics
     fov = camera_state.fov
@@ -62,25 +86,88 @@ def get_camera(
         image_width = aspect * image_height
     pp_w = image_width / 2.0
     pp_h = image_height / 2.0
-    focal_length = pp_h / np.tan(fov / 2.0)
-    intrinsics_matrix = torch.tensor([[focal_length, 0, pp_w], [0, focal_length, pp_h], [0, 0, 1]], dtype=torch.float32)
+    
+    # Use custom intrinsics if provided, otherwise compute from FOV
+    if camera_state.fx is not None:
+        fx = float(camera_state.fx)
+    else:
+        focal_length = pp_h / np.tan(fov / 2.0)
+        fx = float(focal_length)
+    
+    if camera_state.fy is not None:
+        fy = float(camera_state.fy)
+    else:
+        if camera_state.fx is not None:
+            # If fx is provided but fy is not, use fx as fy (square pixels)
+            fy = float(camera_state.fx)
+        else:
+            focal_length = pp_h / np.tan(fov / 2.0)
+            fy = float(focal_length)
+    
+    if camera_state.cx is not None:
+        cx = float(camera_state.cx)
+    else:
+        cx = pp_w
+    
+    if camera_state.cy is not None:
+        cy = float(camera_state.cy)
+    else:
+        cy = pp_h
 
     if camera_state.camera_type is CameraType.EQUIRECTANGULAR:
         fx = float(image_width / 2)
         fy = float(image_height)
-    else:
-        fx = intrinsics_matrix[0, 0]
-        fy = intrinsics_matrix[1, 1]
 
+    # Handle distortion parameters
+    # Construct distortion_params tensor based on camera type
+    # Cameras class expects [*num_cameras 6] shape, so we pad/truncate as needed
+    distortion_params = None
+    metadata = {"cam_idx": camera_state.idx}
+    
+    if camera_state.camera_type == CameraType.FISHEYE:
+        # Fisheye: 4 radial coefficients [k1, k2, k3, k4], pad to 6
+        distortion_params = torch.tensor(
+            [camera_state.k1, camera_state.k2, camera_state.k3, camera_state.k4, 0.0, 0.0],
+            dtype=torch.float32,
+        )[None, ...]
+        # Store full distortion parameters in metadata for rasterization
+        # Fisheye uses 4 radial coefficients
+        metadata["distortion_radial"] = torch.tensor(
+            [camera_state.k1, camera_state.k2, camera_state.k3, camera_state.k4],
+            dtype=torch.float32,
+        )[None, ...]
+    elif camera_state.camera_type == CameraType.PERSPECTIVE:
+        # Perspective: use first 6 for compatibility [k1, k2, k3, k4, p1, p2]
+        distortion_params = torch.tensor(
+            [camera_state.k1, camera_state.k2, camera_state.k3, camera_state.k4, camera_state.p1, camera_state.p2],
+            dtype=torch.float32,
+        )[None, ...]
+        # Store full distortion parameters in metadata for rasterization
+        # Perspective: 6 radial (k1-k6), 2 tangential (p1, p2), 4 thin prism (s1-s4)
+        metadata["distortion_radial"] = torch.tensor(
+            [camera_state.k1, camera_state.k2, camera_state.k3, camera_state.k4, camera_state.k5, camera_state.k6],
+            dtype=torch.float32,
+        )[None, ...]
+        metadata["distortion_tangential"] = torch.tensor(
+            [camera_state.p1, camera_state.p2],
+            dtype=torch.float32,
+        )[None, ...]
+        metadata["distortion_thin_prism"] = torch.tensor(
+            [camera_state.s1, camera_state.s2, camera_state.s3, camera_state.s4],
+            dtype=torch.float32,
+        )[None, ...]
+    # For EQUIRECTANGULAR, distortion_params remains None
+    
     camera = Cameras(
         fx=fx,
         fy=fy,
-        cx=pp_w,
-        cy=pp_h,
+        cx=cx,
+        cy=cy,
         camera_type=camera_state.camera_type,
         camera_to_worlds=camera_state.c2w.to(torch.float32)[None, ...],
         times=torch.tensor([camera_state.time], dtype=torch.float32),
-        metadata={"cam_idx": camera_state.idx},
+        distortion_params=distortion_params,
+        metadata=metadata,
     )
     return camera
 

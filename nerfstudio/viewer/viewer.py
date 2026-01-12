@@ -20,7 +20,7 @@ import contextlib
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -43,7 +43,7 @@ from nerfstudio.viewer.export_panel import populate_export_tab
 from nerfstudio.viewer.render_panel import populate_render_tab
 from nerfstudio.viewer.render_state_machine import RenderAction, RenderStateMachine
 from nerfstudio.viewer.utils import CameraState, parse_object
-from nerfstudio.viewer.viewer_elements import ViewerControl, ViewerElement
+from nerfstudio.viewer.viewer_elements import ViewerControl, ViewerElement, ViewerClick
 from nerfstudio.viewer_legacy.server import viewer_utils
 
 if TYPE_CHECKING:
@@ -93,6 +93,7 @@ class Viewer:
         self.log_filename = log_filename
         self.datapath = datapath.parent if datapath.is_file() else datapath
         self.include_time = self.pipeline.datamanager.includes_time
+        self.train_dataset: Optional[InputDataset] = None  # Will be set in init_scene
 
         if self.config.websocket_port is None:
             websocket_port = viewer_utils.get_free_port(default_port=self.config.websocket_port_default)
@@ -111,6 +112,12 @@ class Viewer:
         self.last_move_time = 0
         # track the camera index that last being clicked
         self.current_camera_idx = 0
+        # Selection mode state
+        self.selection_mode = False
+        self.selected_pixels: List[Dict[str, Any]] = []  # List of {x, y, is_positive, id, patch_data, feature_vector}
+        self._selection_counter = 0  # For unique IDs
+        self.last_rendered_image: Optional[np.ndarray] = None  # Store last rendered image for patch extraction
+        self.last_rendered_features: Optional[torch.Tensor] = None  # Store last rendered features for pixel selection
 
         self.viser_server = viser.ViserServer(host=config.websocket_host, port=websocket_port)
         # Set the name of the URL either to the share link if available, or the localhost
@@ -207,6 +214,7 @@ class Viewer:
                 self._output_type_change,
                 self._output_split_type_change,
                 default_composite_depth=self.config.default_composite_depth,
+                viewer=self,
             )
         config_path = self.log_filename.parents[0] / "config.yml"
         with tabs.add_tab("Render", viser.Icon.CAMERA):
@@ -216,6 +224,9 @@ class Viewer:
 
         with tabs.add_tab("Export", viser.Icon.PACKAGE_EXPORT):
             populate_export_tab(self.viser_server, self.control_panel, config_path, self.pipeline.model)
+        
+        # Initialize selection list UI
+        self.control_panel.initialize_selection_list()
 
         # Keep track of the pointers to generated GUI folders, because each generated folder holds a unique ID.
         viewer_gui_folders = dict()
@@ -337,6 +348,50 @@ class Viewer:
         R = torch.tensor(R.as_matrix())
         pos = torch.tensor(client.camera.position, dtype=torch.float64) / VISER_NERFSTUDIO_SCALE_RATIO
         c2w = torch.concatenate([R, pos[:, None]], dim=1)
+        
+        # Get custom intrinsics and distortion from render tab state if available
+        fx = None
+        fy = None
+        cx = None
+        cy = None
+        # Distortion parameters - will be set as separate attributes in CameraState
+        k1 = k2 = k3 = k4 = k5 = k6 = 0.0
+        p1 = p2 = 0.0
+        s1 = s2 = s3 = s4 = 0.0
+        if self.ready and hasattr(self, 'render_tab_state'):
+            if self.render_tab_state.use_custom_intrinsics:
+                fx = self.render_tab_state.fx
+                fy = self.render_tab_state.fy
+                cx = self.render_tab_state.cx
+                cy = self.render_tab_state.cy
+            if self.render_tab_state.use_distortion:
+                # Determine camera type for distortion parameters
+                if self.render_tab_state.preview_render:
+                    cam_type_str = self.render_tab_state.preview_camera_type
+                else:
+                    cam_type_str = "Perspective"  # Default for non-preview
+                
+                if cam_type_str == "Fisheye":
+                    # Fisheye: 4 radial coefficients
+                    k1 = self.render_tab_state.fisheye_k1
+                    k2 = self.render_tab_state.fisheye_k2
+                    k3 = self.render_tab_state.fisheye_k3
+                    k4 = self.render_tab_state.fisheye_k4
+                else:
+                    # Perspective: 12 parameters (6 radial, 2 tangential, 4 thin prism)
+                    k1 = self.render_tab_state.k1
+                    k2 = self.render_tab_state.k2
+                    k3 = self.render_tab_state.k3
+                    k4 = self.render_tab_state.k4
+                    k5 = self.render_tab_state.k5
+                    k6 = self.render_tab_state.k6
+                    p1 = self.render_tab_state.p1
+                    p2 = self.render_tab_state.p2
+                    s1 = self.render_tab_state.s1
+                    s2 = self.render_tab_state.s2
+                    s3 = self.render_tab_state.s3
+                    s4 = self.render_tab_state.s4
+        
         if self.ready and self.render_tab_state.preview_render:
             camera_type = self.render_tab_state.preview_camera_type
             camera_state = CameraState(
@@ -352,6 +407,22 @@ class Viewer:
                 if camera_type == "Equirectangular"
                 else assert_never(camera_type),
                 idx=self.current_camera_idx,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                k1=k1,
+                k2=k2,
+                k3=k3,
+                k4=k4,
+                k5=k5,
+                k6=k6,
+                p1=p1,
+                p2=p2,
+                s1=s1,
+                s2=s2,
+                s3=s3,
+                s4=s4,
             )
         else:
             camera_state = CameraState(
@@ -360,12 +431,164 @@ class Viewer:
                 c2w=c2w,
                 camera_type=CameraType.PERSPECTIVE,
                 idx=self.current_camera_idx,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                k1=k1,
+                k2=k2,
+                k3=k3,
+                k4=k4,
+                k5=k5,
+                k6=k6,
+                p1=p1,
+                p2=p2,
+                s1=s1,
+                s2=s2,
+                s3=s3,
+                s4=s4,
             )
         return camera_state
 
+    def _load_camera_parameters_to_ui(self, camera_idx: int) -> None:
+        """Load camera parameters from dataset into the custom intrinsics/distortions UI fields.
+        
+        Args:
+            camera_idx: Index of the camera in the training dataset
+        """
+        if not self.ready or not hasattr(self, 'render_tab_state') or self.render_tab_state._ui_elements is None:
+            return
+        
+        if self.train_dataset is None or camera_idx >= len(self.train_dataset):
+            return
+        
+        ui = self.render_tab_state._ui_elements
+        camera = self.train_dataset.cameras[camera_idx].reshape(())
+        
+        # Extract intrinsics
+        fx_val = float(camera.fx[0].cpu())
+        fy_val = float(camera.fy[0].cpu())
+        cx_val = float(camera.cx[0].cpu())
+        cy_val = float(camera.cy[0].cpu())
+        
+        # Calculate FOV from intrinsics (using height)
+        height = float(camera.height[0].cpu())
+        fov_rad = 2 * np.arctan(height / (2 * fy_val))
+        fov_degrees = fov_rad * 180.0 / np.pi
+        
+        # Update FOV slider
+        ui["fov_degrees"].value = fov_degrees
+        
+        # Enable and update custom intrinsics
+        ui["use_custom_intrinsics"].value = True
+        ui["fx_number"].value = fx_val
+        ui["fy_number"].value = fy_val
+        ui["cx_number"].value = cx_val
+        ui["cy_number"].value = cy_val
+        
+        # Extract distortion parameters
+        camera_type_enum = CameraType(int(camera.camera_type[0].cpu()))
+        has_distortion = camera.distortion_params is not None and not torch.all(camera.distortion_params == 0)
+        
+        if has_distortion and camera.distortion_params is not None:
+            # Enable distortion
+            ui["use_distortion"].value = True
+            
+            # Set camera type based on dataset camera type
+            if camera_type_enum == CameraType.FISHEYE:
+                ui["camera_type"].value = "Fisheye"
+                dist_params_raw = camera.distortion_params[0].cpu()
+                # Convert to list safely, handling 0-dim tensors
+                if dist_params_raw.dim() == 0:
+                    dist_list = [float(dist_params_raw.item())]
+                else:
+                    dist_list = dist_params_raw.flatten().tolist()
+                # Fisheye: 4 radial coefficients [k1, k2, k3, k4]
+                ui["fisheye_k1_number"].value = float(dist_list[0]) if len(dist_list) > 0 else 0.0
+                ui["fisheye_k2_number"].value = float(dist_list[1]) if len(dist_list) > 1 else 0.0
+                ui["fisheye_k3_number"].value = float(dist_list[2]) if len(dist_list) > 2 else 0.0
+                ui["fisheye_k4_number"].value = float(dist_list[3]) if len(dist_list) > 3 else 0.0
+            else:
+                # Perspective: 6 radial (k1-k6), 2 tangential (p1, p2), 4 thin prism (s1-s4)
+                ui["camera_type"].value = "Perspective"
+                dist_params_raw = camera.distortion_params[0].cpu()
+                # Convert to list safely, handling 0-dim tensors
+                if dist_params_raw.dim() == 0:
+                    dist_list = [float(dist_params_raw.item())]
+                else:
+                    dist_list = dist_params_raw.flatten().tolist()
+                # Standard format: [k1, k2, k3, k4, p1, p2] for first 6
+                ui["k1_number"].value = float(dist_list[0]) if len(dist_list) > 0 else 0.0
+                ui["k2_number"].value = float(dist_list[1]) if len(dist_list) > 1 else 0.0
+                ui["k3_number"].value = float(dist_list[2]) if len(dist_list) > 2 else 0.0
+                ui["k4_number"].value = float(dist_list[3]) if len(dist_list) > 3 else 0.0
+                ui["p1_number"].value = float(dist_list[4]) if len(dist_list) > 4 else 0.0
+                ui["p2_number"].value = float(dist_list[5]) if len(dist_list) > 5 else 0.0
+                
+                # Check metadata for extended distortion parameters (k5, k6, s1-s4)
+                if camera.metadata is not None:
+                    if "distortion_radial" in camera.metadata:
+                        radial_raw = camera.metadata["distortion_radial"][0].cpu()
+                        # Convert to list safely, handling 0-dim tensors
+                        if radial_raw.dim() == 0:
+                            radial_list = [float(radial_raw.item())]
+                        else:
+                            radial_list = radial_raw.flatten().tolist()
+                        # Radial: [k1, k2, k3, k4, k5, k6] for perspective
+                        if len(radial_list) >= 5:
+                            ui["k5_number"].value = float(radial_list[4])
+                        if len(radial_list) >= 6:
+                            ui["k6_number"].value = float(radial_list[5])
+                    if "distortion_tangential" in camera.metadata:
+                        tangential_raw = camera.metadata["distortion_tangential"][0].cpu()
+                        # Convert to list safely, handling 0-dim tensors
+                        if tangential_raw.dim() == 0:
+                            tangential_list = [float(tangential_raw.item())]
+                        else:
+                            tangential_list = tangential_raw.flatten().tolist()
+                        # Tangential: [p1, p2]
+                        if len(tangential_list) >= 1:
+                            ui["p1_number"].value = float(tangential_list[0])
+                        if len(tangential_list) >= 2:
+                            ui["p2_number"].value = float(tangential_list[1])
+                    if "distortion_thin_prism" in camera.metadata:
+                        thin_prism_raw = camera.metadata["distortion_thin_prism"][0].cpu()
+                        # Convert to list safely, handling 0-dim tensors
+                        if thin_prism_raw.dim() == 0:
+                            thin_prism_list = [float(thin_prism_raw.item())]
+                        else:
+                            thin_prism_list = thin_prism_raw.flatten().tolist()
+                        # Thin prism: [s1, s2, s3, s4]
+                        if len(thin_prism_list) >= 1:
+                            ui["s1_number"].value = float(thin_prism_list[0])
+                        if len(thin_prism_list) >= 2:
+                            ui["s2_number"].value = float(thin_prism_list[1])
+                        if len(thin_prism_list) >= 3:
+                            ui["s3_number"].value = float(thin_prism_list[2])
+                        if len(thin_prism_list) >= 4:
+                            ui["s4_number"].value = float(thin_prism_list[3])
+                    else:
+                        # Set thin prism to 0 if not in metadata
+                        ui["s1_number"].value = 0.0
+                        ui["s2_number"].value = 0.0
+                        ui["s3_number"].value = 0.0
+                        ui["s4_number"].value = 0.0
+                else:
+                    # No metadata, set extended parameters to 0
+                    ui["k5_number"].value = 0.0
+                    ui["k6_number"].value = 0.0
+                    ui["s1_number"].value = 0.0
+                    ui["s2_number"].value = 0.0
+                    ui["s3_number"].value = 0.0
+                    ui["s4_number"].value = 0.0
+        else:
+            # Disable distortion if no distortion parameters
+            ui["use_distortion"].value = False
+
     def handle_disconnect(self, client: viser.ClientHandle) -> None:
-        self.render_statemachines[client.client_id].running = False
-        self.render_statemachines.pop(client.client_id)
+        if client.client_id in self.render_statemachines:
+            self.render_statemachines[client.client_id].running = False
+            self.render_statemachines.pop(client.client_id)
 
     def handle_new_client(self, client: viser.ClientHandle) -> None:
         self.render_statemachines[client.client_id] = RenderStateMachine(self, VISER_NERFSTUDIO_SCALE_RATIO, client)
@@ -374,6 +597,12 @@ class Viewer:
         @client.camera.on_update
         def _(_: viser.CameraHandle) -> None:
             if not self.ready:
+                return
+            # Skip camera updates when in selection mode
+            if self.selection_mode:
+                return
+            # Check if render state machine exists for this client
+            if client.client_id not in self.render_statemachines:
                 return
             self.last_move_time = time.time()
             with self.viser_server.atomic():
@@ -385,6 +614,339 @@ class Viewer:
         with self.viser_server.atomic():
             for idx in self.camera_handles:
                 self.camera_handles[idx].visible = visible
+    
+    def set_selection_mode(self, enabled: bool) -> None:
+        """Enable or disable selection mode.
+        
+        Args:
+            enabled: If True, enables selection mode and disables camera navigation.
+                     If False, disables selection mode and enables camera navigation.
+        """
+        # Always ensure callback is removed first when disabling, even if we think it's already removed
+        if not enabled and hasattr(self, '_selection_callback'):
+            try:
+                self.viser_server.scene.remove_pointer_callback()
+            except Exception:
+                pass
+            if hasattr(self, '_selection_callback'):
+                delattr(self, '_selection_callback')
+        
+        self.selection_mode = enabled
+        
+        if enabled:
+            # Register pointer callback for selection directly with viser
+            # Use the ViewerControl wrapper to avoid interfering with other handlers
+            
+            def wrapped_cb(scene_pointer_msg):
+                try:
+                    # Debug: Check if callback is being triggered
+                    # print(f"Selection callback triggered: event_type={scene_pointer_msg.event_type}, selection_mode={self.selection_mode}")
+                    
+                    # Only handle click events, not drag or other events
+                    # This allows camera drag to work normally
+                    if scene_pointer_msg.event_type != "click":
+                        return
+                    
+                    origin = scene_pointer_msg.ray_origin
+                    direction = scene_pointer_msg.ray_direction
+                    if origin is None or direction is None:
+                        return
+                    
+                    # Access screen_pos safely
+                    screen_pos = scene_pointer_msg.screen_pos
+                    if not screen_pos or len(screen_pos) == 0:
+                        return
+                    screen_pos = screen_pos[0] if isinstance(screen_pos, (list, tuple)) else screen_pos
+                    
+                    origin = tuple([x / VISER_NERFSTUDIO_SCALE_RATIO for x in origin])
+                    
+                    # Get button info - default to "left" if not available
+                    button = getattr(scene_pointer_msg, 'button', None)
+                    if button is not None and isinstance(button, int):
+                        button_map = {0: "left", 1: "middle", 2: "right"}
+                        button = button_map.get(button, "left")  # Default to left if unknown
+                    else:
+                        # If button is not available, assume left click
+                        button = "left"
+                    
+                    click = ViewerClick(origin, direction, screen_pos, button=button)
+                    # Handle left clicks for pixel selection (or if button is None/unknown, treat as left)
+                    if button == "left" or button is None:
+                        # Debug: Verify we're calling the handler
+                        # print(f"Calling _handle_pixel_selection: screen_pos={screen_pos}, button={button}")
+                        self._handle_pixel_selection(click)
+                except Exception as e:
+                    # Log error but don't break the viewer
+                    import traceback
+                    print(f"Error in selection callback: {e}")
+                    print(traceback.format_exc())
+            
+            # Register callback only for click events (not drag/move)
+            # This should not interfere with camera drag navigation
+            try:
+                self.viser_server.scene.on_pointer_event(event_type="click")(wrapped_cb)
+                self._selection_callback = wrapped_cb
+                print(f"DEBUG: Selection callback registered successfully, selection_mode={self.selection_mode}")
+            except Exception as e:
+                print(f"ERROR: Failed to register selection callback: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    def _handle_pixel_selection(self, click: "ViewerClick") -> None:
+        """Handle pixel selection click event.
+        
+        Args:
+            click: The click event containing screen position and button info
+        """
+        try:
+            # Debug: Check if handler is called
+            print(f"DEBUG: _handle_pixel_selection called: selection_mode={self.selection_mode}, screen_pos={click.screen_pos}")
+            
+            if not self.selection_mode:
+                print("DEBUG: Selection mode is False, returning early")
+                return
+            
+            # Get screen position (normalized [0, 1])
+            screen_x, screen_y = click.screen_pos
+            
+            # Extract image patch if available
+            patch_data = None
+            if self.last_rendered_image is not None:
+                try:
+                    patch_data = self._extract_image_patch(screen_x, screen_y, self.last_rendered_image)
+                except Exception:
+                    patch_data = None
+            
+            # Extract feature vector at selected pixel if available
+            # This is optional - selection should work even if feature extraction fails
+            feature_vector = None
+            if self.last_rendered_features is not None:
+                try:
+                    feature_vector = self._extract_feature_vector(screen_x, screen_y, self.last_rendered_features)
+                except Exception as e:
+                    # Feature extraction failed - log but don't break selection
+                    import traceback
+                    print(f"Warning: Failed to extract feature vector: {e}")
+                    feature_vector = None
+            
+            # Sync with model's viewer_utils if available (for pc-feature-splatting)
+            # This allows the model to use the stored feature vector for similarity computation
+            # This is optional - selection should work even if model sync fails
+            try:
+                # Only try to sync if we have a pipeline (viewer is ready)
+                if hasattr(self, 'pipeline') and self.pipeline is not None:
+                    model = self.get_model()
+                    # Check if this is a PCFeatureSplattingModel with viewer_utils
+                    if hasattr(model, 'viewer_utils') and hasattr(model.viewer_utils, 'set_selected_pixel'):
+                        # Update viewer_utils with pixel location and feature vector
+                        model.viewer_utils.set_selected_pixel(screen_x, screen_y, feature_vector)
+            except Exception as e:
+                # Silently fail if model doesn't have viewer_utils (not pc-feature-splatting)
+                # This is expected for non-pc-feature-splatting models
+                # Don't log errors here as this is expected for many models
+                pass
+            
+            # Add to selection list (only left clicks supported)
+            self._selection_counter += 1
+            pixel_id = self._selection_counter
+            pixel_data = {
+                "id": pixel_id,
+                "x": screen_x,
+                "y": screen_y,
+                "is_positive": True,  # Default to positive (green +)
+                "patch_data": patch_data,  # Base64 encoded patch image (not displayed in UI)
+                "feature_vector": feature_vector,  # Feature vector at selected pixel (torch.Tensor or None, stored but not displayed in UI)
+            }
+            self.selected_pixels.append(pixel_data)
+            
+            # Update UI
+            if hasattr(self, 'control_panel') and self.control_panel is not None:
+                try:
+                    self.control_panel.update_selection_list()
+                except Exception:
+                    pass  # Silently fail if UI update fails
+        except Exception as e:
+            # Log error but don't break the viewer
+            import traceback
+            print(f"Error in pixel selection: {e}")
+            print(traceback.format_exc())
+    
+    def _extract_feature_vector(self, screen_x: float, screen_y: float, features: torch.Tensor) -> Optional[torch.Tensor]:
+        """Extract feature vector at the clicked pixel location.
+        
+        Args:
+            screen_x: Normalized x coordinate [0, 1]
+            screen_y: Normalized y coordinate [0, 1]
+            features: The rendered features as torch tensor (H, W, C) or (C, H, W)
+            
+        Returns:
+            Feature vector at the pixel location (C,) or None if extraction fails
+        """
+        try:
+            # Handle different feature tensor formats
+            if len(features.shape) == 3:
+                if features.shape[0] < features.shape[2]:  # Likely (H, W, C)
+                    h, w, c = features.shape
+                    pixel_x = int(screen_x * w)
+                    pixel_y = int(screen_y * h)
+                    pixel_x = max(0, min(pixel_x, w - 1))
+                    pixel_y = max(0, min(pixel_y, h - 1))
+                    feature_vector = features[pixel_y, pixel_x, :].clone()  # [C]
+                else:  # Likely (C, H, W)
+                    c, h, w = features.shape
+                    pixel_x = int(screen_x * w)
+                    pixel_y = int(screen_y * h)
+                    pixel_x = max(0, min(pixel_x, w - 1))
+                    pixel_y = max(0, min(pixel_y, h - 1))
+                    feature_vector = features[:, pixel_y, pixel_x].clone()  # [C]
+            else:
+                return None
+            
+            return feature_vector
+        except Exception:
+            return None
+    
+    def _extract_image_patch(self, screen_x: float, screen_y: float, image: np.ndarray) -> Optional[str]:
+        """Extract a 16x16 pixel patch centered at the clicked location.
+        
+        Args:
+            screen_x: Normalized x coordinate [0, 1]
+            screen_y: Normalized y coordinate [0, 1]
+            image: The rendered image as numpy array (H, W, 3)
+            
+        Returns:
+            Base64 encoded image string or None if extraction fails
+        """
+        import base64
+        from io import BytesIO
+        from PIL import Image
+        
+        try:
+            h, w = image.shape[:2]
+            # Convert normalized coordinates to pixel coordinates
+            pixel_x = int(screen_x * w)
+            pixel_y = int(screen_y * h)
+            
+            # Extract 16x16 patch centered at the pixel
+            patch_size = 16
+            half_size = patch_size // 2
+            
+            # Calculate bounds with clamping
+            x_start = max(0, pixel_x - half_size)
+            x_end = min(w, pixel_x + half_size)
+            y_start = max(0, pixel_y - half_size)
+            y_end = min(h, pixel_y + half_size)
+            
+            # Extract patch
+            patch = image[y_start:y_end, x_start:x_end, :]
+            
+            # If patch is smaller than 16x16 (near edges), pad it
+            if patch.shape[0] < patch_size or patch.shape[1] < patch_size:
+                padded_patch = np.zeros((patch_size, patch_size, 3), dtype=patch.dtype)
+                pad_y = (patch_size - patch.shape[0]) // 2
+                pad_x = (patch_size - patch.shape[1]) // 2
+                padded_patch[pad_y:pad_y+patch.shape[0], pad_x:pad_x+patch.shape[1], :] = patch
+                patch = padded_patch
+            
+            # Convert to PIL Image and encode as base64
+            patch_uint8 = patch.astype(np.uint8)
+            pil_image = Image.fromarray(patch_uint8)
+            buffer = BytesIO()
+            pil_image.save(buffer, format='PNG')
+            img_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            return f"data:image/png;base64,{img_str}"
+        except Exception:
+            return None
+    
+    def _patch_to_svg_icon(self, patch_data: str) -> Optional[str]:
+        """Convert a base64 image patch to an SVG icon string.
+        
+        Args:
+            patch_data: Base64 encoded image data URL (e.g., "data:image/png;base64,...")
+            
+        Returns:
+            SVG string with embedded image, or None if conversion fails
+        """
+        try:
+            if not patch_data or not patch_data.startswith("data:image"):
+                return None
+            
+            # Extract the base64 part
+            base64_data = patch_data.split(",")[1] if "," in patch_data else None
+            if not base64_data:
+                return None
+            
+            # Create an SVG with the embedded image
+            # Size: 32x32 pixels to match icon size
+            svg = f'''<svg width="32" height="32" xmlns="http://www.w3.org/2000/svg">
+  <image href="{patch_data}" width="32" height="32" preserveAspectRatio="none"/>
+  <rect width="32" height="32" fill="none" stroke="#ccc" stroke-width="1"/>
+</svg>'''
+            return svg
+        except Exception:
+            return None
+    
+    def toggle_pixel_sign(self, pixel_id: int) -> None:
+        """Toggle the positive/negative sign of a selected pixel.
+        
+        Args:
+            pixel_id: The ID of the pixel to toggle
+        """
+        for pixel_data in self.selected_pixels:
+            if pixel_data["id"] == pixel_id:
+                pixel_data["is_positive"] = not pixel_data["is_positive"]
+                break
+    
+    def clear_selected_pixels(self) -> None:
+        """Clear all selected pixels."""
+        self.selected_pixels.clear()
+        
+        # Clear model's viewer_utils selection
+        try:
+            model = self.get_model()
+            if hasattr(model, 'viewer_utils') and hasattr(model.viewer_utils, 'set_selected_pixel'):
+                model.viewer_utils.set_selected_pixel(None, None)
+        except Exception:
+            pass
+    
+    def remove_selected_pixel(self, pixel_id: int) -> None:
+        """Remove a specific selected pixel by ID.
+        
+        Args:
+            pixel_id: The ID of the pixel to remove
+        """
+        # Find the pixel to remove
+        pixel_to_remove = None
+        for p in self.selected_pixels:
+            if p["id"] == pixel_id:
+                pixel_to_remove = p
+                break
+        
+        # Remove from list
+        self.selected_pixels = [p for p in self.selected_pixels if p["id"] != pixel_id]
+        
+        # If this was the last selected pixel, clear model's viewer_utils selection
+        if len(self.selected_pixels) == 0:
+            try:
+                model = self.get_model()
+                if hasattr(model, 'viewer_utils') and hasattr(model.viewer_utils, 'set_selected_pixel'):
+                    model.viewer_utils.set_selected_pixel(None, None)
+            except Exception:
+                pass
+    
+    def get_pixel_sign(self, pixel_id: int) -> Optional[bool]:
+        """Get the positive/negative sign of a selected pixel.
+        
+        Args:
+            pixel_id: The ID of the pixel
+            
+        Returns:
+            True if positive, False if negative, None if pixel not found
+        """
+        for pixel_data in self.selected_pixels:
+            if pixel_data["id"] == pixel_id:
+                return pixel_data["is_positive"]
+        return None
 
     def update_camera_poses(self):
         # TODO this fn accounts for like ~5% of total train time
@@ -414,6 +976,8 @@ class Viewer:
             return
         clients = self.viser_server.get_clients()
         for id in clients:
+            if id not in self.render_statemachines:
+                continue
             camera_state = self.get_camera_state(clients[id])
             self.render_statemachines[id].action(RenderAction("move", camera_state))
 
@@ -430,6 +994,7 @@ class Viewer:
 
     def _output_split_type_change(self, _):
         self.output_split_type_changed = True
+
 
     def _pick_drawn_image_idxs(self, total_num: int) -> list[int]:
         """Determine indicies of images to display in viewer.
@@ -459,6 +1024,9 @@ class Viewer:
             dataset: dataset to render in the scene
             train_state: Current status of training
         """
+        # Store train_dataset reference for camera parameter loading
+        self.train_dataset = train_dataset
+        
         # draw the training cameras and images
         self.camera_handles: Dict[int, viser.CameraFrustumHandle] = {}
         self.original_c2w: Dict[int, np.ndarray] = {}
@@ -494,6 +1062,8 @@ class Viewer:
                         event.client.camera.position = event.target.position
                         event.client.camera.wxyz = event.target.wxyz
                         self.current_camera_idx = capture_idx
+                        # Load camera parameters into custom intrinsics/distortions fields
+                        self._load_camera_parameters_to_ui(capture_idx)
 
                 return on_click_callback
 
@@ -539,6 +1109,8 @@ class Viewer:
                 self.last_step = step
                 clients = self.viser_server.get_clients()
                 for id in clients:
+                    if id not in self.render_statemachines:
+                        continue
                     camera_state = self.get_camera_state(clients[id])
                     if camera_state is not None:
                         self.render_statemachines[id].action(RenderAction("step", camera_state))

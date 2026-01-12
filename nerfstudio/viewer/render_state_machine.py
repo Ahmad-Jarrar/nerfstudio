@@ -235,9 +235,32 @@ class RenderStateMachine(threading.Thread):
     def check_interrupt(self, frame, event, arg):
         """Raises interrupt when flag has been set and not already on lowest resolution.
         Used in conjunction with SetTrace.
+        
+        Simplified to only raise exceptions when we're clearly in user/application code,
+        not during torch dynamo compilation or system operations.
         """
         if event == "line":
             if self.interrupt_render_flag:
+                # Only raise exception if we're in user/application code
+                # Skip if we're in any system/library code (torch, Python stdlib, etc.)
+                if frame is not None and hasattr(frame, 'f_code'):
+                    filename = frame.f_code.co_filename
+                    
+                    # Quick check: if filename contains any system/library paths, skip
+                    # This is much faster than checking the entire call stack
+                    if any(keyword in filename for keyword in [
+                        "torch/",           # Any torch code (dynamo, ops, etc.)
+                        "site-packages/",   # Installed packages
+                        "traceback.py",
+                        "linecache.py",
+                        "tokenize.py",
+                        "inspect.py",
+                        "<frozen",
+                        "<built-in>",
+                    ]):
+                        return self.check_interrupt
+                
+                # We're in user code - safe to raise exception
                 self.interrupt_render_flag = False
                 raise viewer_utils.IOChangeException
         return self.check_interrupt
@@ -313,6 +336,22 @@ class RenderStateMachine(threading.Thread):
             jpeg_quality=jpg_quality,
             depth=depth,
         )
+        # Store the rendered image for pixel selection patch extraction
+        self.viewer.last_rendered_image = selected_output.copy()
+        
+        # Store the rendered features for pixel selection feature extraction
+        # Check if "feature" is in outputs and store it
+        if "feature" in outputs:
+            # Features are typically in (H, W, C) format from get_outputs_for_camera
+            feature_tensor = outputs["feature"]
+            if isinstance(feature_tensor, torch.Tensor):
+                # Store on CPU to avoid GPU memory issues
+                self.viewer.last_rendered_features = feature_tensor.cpu().clone()
+            else:
+                self.viewer.last_rendered_features = None
+        else:
+            self.viewer.last_rendered_features = None
+        
         res = f"{selected_output.shape[1]}x{selected_output.shape[0]}px"
         self.viewer.stats_markdown.content = self.viewer.make_stats_markdown(None, res)
 

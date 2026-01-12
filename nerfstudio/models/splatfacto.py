@@ -36,7 +36,7 @@ from pytorch_msssim import SSIM
 from torch.nn import Parameter
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
-from nerfstudio.cameras.cameras import Cameras
+from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
@@ -174,6 +174,11 @@ class SplatfactoModelConfig(ModelConfig):
     freeze_means: bool = False
     """If True, freeze the means (positions) parameters so that 3D points do not move from their original positions.
     Only other parameters (colors, opacities, scales, rotations) will be optimized."""
+    use_distortion: bool = False
+    """If True, use camera distortion parameters during rasterization. Requires a strategy that supports distortion (not DefaultStrategy)."""
+    initial_scale_percentile: Optional[float] = 95.0
+    """Percentile to clamp initial scales at to prevent outliers from creating huge gaussians. 
+    If None, no clamping is applied. Typical values: 90-99. Default 95.0."""
 
 
 class SplatfactoModel(Model):
@@ -206,6 +211,12 @@ class SplatfactoModel(Model):
         distances, _ = k_nearest_sklearn(means.data, 3)
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
+        
+        # Clamp outlier scales to prevent huge gaussians from outlier points
+        if self.config.initial_scale_percentile is not None:
+            percentile_value = torch.quantile(avg_dist, self.config.initial_scale_percentile / 100.0)
+            avg_dist = torch.clamp(avg_dist, max=percentile_value)
+        
         if self.config.use_uniform_scale:
             # Store as 1D scalar for spherical Gaussians
             scales = torch.nn.Parameter(torch.log(avg_dist))
@@ -612,11 +623,17 @@ class SplatfactoModel(Model):
         camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
         # Extract distortion parameters from camera metadata if available
-        # Only use distortion parameters if strategy is NOT default (default strategy doesn't support distortion)
+        # Use distortion if enabled in config and strategy supports it
         radial = None
         tangential = None
         thin_prism = None
-        use_distortion = not isinstance(self.strategy, DefaultStrategy)
+        use_distortion = self.config.use_distortion
+        
+        # # Assert that strategy supports distortion when use_distortion is enabled
+        # if use_distortion:
+        #     assert not isinstance(
+        #         self.strategy, DefaultStrategy
+        #     ), "Distortion is enabled but DefaultStrategy does not support distortion. Please use 'mcmc' or 'custom' strategy."
         
         if use_distortion and camera.metadata is not None:
             if "distortion_radial" in camera.metadata:
@@ -626,16 +643,21 @@ class SplatfactoModel(Model):
             if "distortion_thin_prism" in camera.metadata:
                 thin_prism = camera.metadata["distortion_thin_prism"].cuda()
         
+        # Determine if this camera should be treated as fisheye for rasterization
+        camera_type_val = camera.camera_type.item() if hasattr(camera.camera_type, "item") else camera.camera_type
+        is_fisheye_camera = False
+        camera_type_enum: Optional[CameraType] = None
+        try:
+            camera_type_enum = CameraType(camera_type_val)
+            is_fisheye_camera = camera_type_enum in (CameraType.FISHEYE, CameraType.FISHEYE624)
+        except (ValueError, TypeError):
+            pass
+        has_fisheye_radial = radial is not None and radial.shape[-1] >= 4
+
         # Log distortion parameters being used for rasterization (only once)
         if use_distortion and not self._logged_distortion and (radial is not None or tangential is not None or thin_prism is not None):
             from nerfstudio.utils.rich_utils import CONSOLE
-            from nerfstudio.cameras.cameras import CameraType
-            camera_type_val = camera.camera_type.item() if hasattr(camera.camera_type, 'item') else camera.camera_type
-            try:
-                camera_type_enum = CameraType(camera_type_val)
-                camera_type_name = camera_type_enum.name
-            except (ValueError, TypeError):
-                camera_type_name = str(camera_type_val)
+            camera_type_name = camera_type_enum.name if camera_type_enum is not None else str(camera_type_val)
             strategy_name = type(self.strategy).__name__
             CONSOLE.log(f"[cyan]Rasterization with distortion (strategy: {strategy_name}) - Camera type: {camera_type_name}")
             if radial is not None:
@@ -690,19 +712,22 @@ class SplatfactoModel(Model):
             "rasterize_mode": self.config.rasterize_mode,
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
-            "with_ut": True,
-            "with_eval3d": True,
+            "with_ut": use_distortion,
+            "with_eval3d": use_distortion,
         }
         
         # Add distortion parameters if available and strategy supports them (not default strategy)
         # Only pass distortion parameters if use_distortion is True (strategy is not DefaultStrategy)
         if use_distortion:
             if radial is not None:
-                rasterization_kwargs["radial"] = radial
+                rasterization_kwargs["radial_coeffs"] = radial
             if tangential is not None:
-                rasterization_kwargs["tangential"] = tangential
+                rasterization_kwargs["tangential_coeffs"] = tangential
             if thin_prism is not None:
-                rasterization_kwargs["thin_prism"] = thin_prism
+                rasterization_kwargs["thin_prism_coeffs"] = thin_prism
+            # Switch to fisheye camera model when fisheye coefficients are present
+            if is_fisheye_camera or has_fisheye_radial:
+                rasterization_kwargs["camera_model"] = "fisheye"
 
         render, alpha, self.info = rasterization(**rasterization_kwargs)  # type: ignore[reportPossiblyUnboundVariable]
         if self.training:

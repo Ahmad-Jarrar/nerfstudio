@@ -153,17 +153,24 @@ class Nerfstudio(DataParser):
                 assert "w" in frame, "width not specified in frame"
                 width.append(int(frame["w"]))
             if not distort_fixed:
+                # Extract all available distortion parameters, pad missing ones with zeros
+                k1 = float(frame.get("k1", 0.0))
+                k2 = float(frame.get("k2", 0.0))
+                k3 = float(frame.get("k3", 0.0))
+                k4 = float(frame.get("k4", 0.0))
+                k5 = float(frame.get("k5", 0.0))
+                k6 = float(frame.get("k6", 0.0))
+                p1 = float(frame.get("p1", 0.0))
+                p2 = float(frame.get("p2", 0.0))
+                s1 = float(frame.get("s1", 0.0))
+                s2 = float(frame.get("s2", 0.0))
+                s3 = float(frame.get("s3", 0.0))
+                s4 = float(frame.get("s4", 0.0))
+                
                 distort.append(
                     torch.tensor(frame["distortion_params"], dtype=torch.float32)
                     if "distortion_params" in frame
-                    else camera_utils.get_distortion_params(
-                        k1=float(frame["k1"]) if "k1" in frame else 0.0,
-                        k2=float(frame["k2"]) if "k2" in frame else 0.0,
-                        k3=float(frame["k3"]) if "k3" in frame else 0.0,
-                        k4=float(frame["k4"]) if "k4" in frame else 0.0,
-                        p1=float(frame["p1"]) if "p1" in frame else 0.0,
-                        p2=float(frame["p2"]) if "p2" in frame else 0.0,
-                    )
+                    else torch.tensor([k1, k2, k3, k4, p1, p2], dtype=torch.float32)  # For Cameras class compatibility
                 )
 
             image_filenames.append(fname)
@@ -270,77 +277,169 @@ class Nerfstudio(DataParser):
         else:
             camera_type = CameraType.PERSPECTIVE
 
+        # Detect fisheye-specific distortion parameters provided alongside zero pinhole params.
+        # If fisheye_k* are present, switch the camera model to FISHEYE so downstream
+        # rendering can use the correct projection when distortion is enabled.
+        fisheye_keys = ["fisheye_k1", "fisheye_k2", "fisheye_k3", "fisheye_k4"]
+        has_fisheye_params = any(k in meta for k in fisheye_keys)
+        fisheye_params_list = [
+            float(meta.get("fisheye_k1", 0.0)),
+            float(meta.get("fisheye_k2", 0.0)),
+            float(meta.get("fisheye_k3", 0.0)),
+            float(meta.get("fisheye_k4", 0.0)),
+        ]
+
         fx = float(meta["fl_x"]) if fx_fixed else torch.tensor(fx, dtype=torch.float32)[idx_tensor]
         fy = float(meta["fl_y"]) if fy_fixed else torch.tensor(fy, dtype=torch.float32)[idx_tensor]
         cx = float(meta["cx"]) if cx_fixed else torch.tensor(cx, dtype=torch.float32)[idx_tensor]
         cy = float(meta["cy"]) if cy_fixed else torch.tensor(cy, dtype=torch.float32)[idx_tensor]
         height = int(meta["h"]) if height_fixed else torch.tensor(height, dtype=torch.int32)[idx_tensor]
         width = int(meta["w"]) if width_fixed else torch.tensor(width, dtype=torch.int32)[idx_tensor]
+        # Extract distortion parameters from metadata (for both fixed and variable cases)
+        # For perspective cameras, extract all available distortion parameters
+        # Extract k1-k6 (radial), p1-p2 (tangential), s1-s4 (thin prism)
+        # If not available, default to 0.0
+        k1 = float(meta.get("k1", 0.0))
+        k2 = float(meta.get("k2", 0.0))
+        k3 = float(meta.get("k3", 0.0))
+        k4 = float(meta.get("k4", 0.0))
+        k5 = float(meta.get("k5", 0.0))
+        k6 = float(meta.get("k6", 0.0))
+        p1 = float(meta.get("p1", 0.0))
+        p2 = float(meta.get("p2", 0.0))
+        s1 = float(meta.get("s1", 0.0))
+        s2 = float(meta.get("s2", 0.0))
+        s3 = float(meta.get("s3", 0.0))
+        s4 = float(meta.get("s4", 0.0))
+        
         if distort_fixed:
-            distortion_params = (
-                torch.tensor(meta["distortion_params"], dtype=torch.float32)
-                if "distortion_params" in meta
-                else camera_utils.get_distortion_params(
-                    k1=float(meta["k1"]) if "k1" in meta else 0.0,
-                    k2=float(meta["k2"]) if "k2" in meta else 0.0,
-                    k3=float(meta["k3"]) if "k3" in meta else 0.0,
-                    k4=float(meta["k4"]) if "k4" in meta else 0.0,
-                    p1=float(meta["p1"]) if "p1" in meta else 0.0,
-                    p2=float(meta["p2"]) if "p2" in meta else 0.0,
+            if has_fisheye_params:
+                # Prioritize fisheye parameters when provided; treat pinhole params as zero.
+                distortion_params = torch.tensor(fisheye_params_list, dtype=torch.float32)
+                camera_type = CameraType.FISHEYE
+            else:
+                # For Cameras class compatibility, use first 6 params [k1, k2, k3, k4, p1, p2]
+                distortion_params = (
+                    torch.tensor(meta["distortion_params"], dtype=torch.float32)
+                    if "distortion_params" in meta
+                    else torch.tensor([k1, k2, k3, k4, p1, p2], dtype=torch.float32)
                 )
-            )
         else:
-            distortion_params = torch.stack(distort, dim=0)[idx_tensor]
+            if has_fisheye_params:
+                camera_type = CameraType.FISHEYE
+                distortion_params = torch.tensor(fisheye_params_list, dtype=torch.float32).unsqueeze(0).repeat(idx_tensor.shape[0], 1)
+            else:
+                distortion_params = torch.stack(distort, dim=0)[idx_tensor]
 
         # Parse distortion parameters into separate vectors for rasterization
-        # For OpenCV: distortion_params = [k1, k2, k3, k4, p1, p2]
-        # Radial: k1, k2, k3 (k4 is typically 0 for OpenCV)
-        # Tangential: p1, p2
-        # Thin prism: empty for OpenCV (only for FISHEYE624)
+        # Extract all available parameters from metadata, pad missing ones with zeros
         radial = None
         tangential = None
         thin_prism = None
         
-        if distortion_params is not None and distortion_params.numel() > 0:
-            # Ensure distortion_params has the right shape
-            if distortion_params.dim() == 1:
-                distortion_params = distortion_params.unsqueeze(0)
-            
-            if distortion_params.shape[-1] == 6:  # OpenCV format [k1, k2, k3, k4, p1, p2]
-                radial = distortion_params[..., :3]  # k1, k2, k3
-                tangential = distortion_params[..., 4:6]  # p1, p2
-                # Create empty thin_prism tensor with same batch shape
-                thin_prism = torch.zeros((*distortion_params.shape[:-1], 0), dtype=distortion_params.dtype, device=distortion_params.device)
-            elif distortion_params.shape[-1] == 12:  # FISHEYE624 format [k0...k5, p0, p1, s0...s3]
-                radial = distortion_params[..., :6]  # k0...k5
-                tangential = distortion_params[..., 6:8]  # p0, p1
-                thin_prism = distortion_params[..., 8:12]  # s0...s3
-            elif distortion_params.shape[-1] == 5:  # 5 OpenCV params [k1, k2, p1, p2, k3] (OpenCV order)
-                # OpenCV order: k1, k2, p1, p2, k3
-                radial = torch.stack([
-                    distortion_params[..., 0],  # k1
-                    distortion_params[..., 1],  # k2
-                    distortion_params[..., 4],  # k3
-                ], dim=-1)
-                tangential = distortion_params[..., 2:4]  # p1, p2
-                thin_prism = torch.zeros((*distortion_params.shape[:-1], 0), dtype=distortion_params.dtype, device=distortion_params.device)
+        if camera_type == CameraType.FISHEYE:
+            # Fisheye: 4 radial coefficients [k1, k2, k3, k4]
+            if distort_fixed:
+                # Extract from fisheye_params_list (already extracted above)
+                radial = torch.tensor([fisheye_params_list], dtype=torch.float32)
+                tangential = torch.zeros((1, 0), dtype=torch.float32)
+                thin_prism = torch.zeros((1, 0), dtype=torch.float32)
             else:
-                # Fallback: try to infer from available parameters
-                # Try to extract k1, k2, k3, p1, p2 from whatever is available
-                radial = torch.zeros((*distortion_params.shape[:-1], 3), dtype=distortion_params.dtype, device=distortion_params.device)
-                tangential = torch.zeros((*distortion_params.shape[:-1], 2), dtype=distortion_params.dtype, device=distortion_params.device)
-                thin_prism = torch.zeros((*distortion_params.shape[:-1], 0), dtype=distortion_params.dtype, device=distortion_params.device)
+                # Variable distortion per frame
+                if distortion_params is not None and distortion_params.numel() > 0:
+                    if distortion_params.dim() == 1:
+                        distortion_params = distortion_params.unsqueeze(0)
+                    # Extract k1-k4, pad to 4 if needed
+                    if distortion_params.shape[-1] >= 4:
+                        radial = distortion_params[..., :4]
+                    else:
+                        # Pad with zeros if fewer than 4 parameters
+                        radial = torch.zeros((*distortion_params.shape[:-1], 4), dtype=distortion_params.dtype, device=distortion_params.device)
+                        radial[..., :distortion_params.shape[-1]] = distortion_params
+                    tangential = torch.zeros((*radial.shape[:-1], 0), dtype=radial.dtype, device=radial.device)
+                    thin_prism = torch.zeros((*radial.shape[:-1], 0), dtype=radial.dtype, device=radial.device)
+                else:
+                    # No distortion params, create zero tensors
+                    batch_size = len(indices)
+                    radial = torch.zeros((batch_size, 4), dtype=torch.float32)
+                    tangential = torch.zeros((batch_size, 0), dtype=torch.float32)
+                    thin_prism = torch.zeros((batch_size, 0), dtype=torch.float32)
+        elif camera_type == CameraType.PERSPECTIVE:
+            # Perspective: 6 radial (k1-k6), 2 tangential (p1, p2), 4 thin prism (s1-s4)
+            if distort_fixed:
+                # Extract from meta dict (already extracted above)
+                radial = torch.tensor([[k1, k2, k3, k4, k5, k6]], dtype=torch.float32)
+                tangential = torch.tensor([[p1, p2]], dtype=torch.float32)
+                thin_prism = torch.tensor([[s1, s2, s3, s4]], dtype=torch.float32)
+            else:
+                # Variable distortion per frame - extract from per-frame data
+                batch_size = len(indices)
+                radial = torch.zeros((batch_size, 6), dtype=torch.float32)
+                tangential = torch.zeros((batch_size, 2), dtype=torch.float32)
+                thin_prism = torch.zeros((batch_size, 4), dtype=torch.float32)
                 
-                if distortion_params.shape[-1] >= 1:
-                    radial[..., 0] = distortion_params[..., 0]  # k1
-                if distortion_params.shape[-1] >= 2:
-                    radial[..., 1] = distortion_params[..., 1]  # k2
-                if distortion_params.shape[-1] >= 3:
-                    radial[..., 2] = distortion_params[..., 2]  # k3 (or might be p1)
-                if distortion_params.shape[-1] >= 4:
-                    tangential[..., 0] = distortion_params[..., 3]  # p1
-                if distortion_params.shape[-1] >= 5:
-                    tangential[..., 1] = distortion_params[..., 4]  # p2
+                # Extract from each frame's distortion_params or individual parameters
+                for i, idx in enumerate(indices):
+                    frame = frames[idx]
+                    # Extract individual parameters from frame, defaulting to 0.0 if not present
+                    radial[i, 0] = float(frame.get("k1", 0.0))
+                    radial[i, 1] = float(frame.get("k2", 0.0))
+                    radial[i, 2] = float(frame.get("k3", 0.0))
+                    radial[i, 3] = float(frame.get("k4", 0.0))
+                    radial[i, 4] = float(frame.get("k5", 0.0))
+                    radial[i, 5] = float(frame.get("k6", 0.0))
+                    tangential[i, 0] = float(frame.get("p1", 0.0))
+                    tangential[i, 1] = float(frame.get("p2", 0.0))
+                    thin_prism[i, 0] = float(frame.get("s1", 0.0))
+                    thin_prism[i, 1] = float(frame.get("s2", 0.0))
+                    thin_prism[i, 2] = float(frame.get("s3", 0.0))
+                    thin_prism[i, 3] = float(frame.get("s4", 0.0))
+                    
+                    # If distortion_params tensor exists, try to extract from it as fallback
+                    # (for backward compatibility with old data formats)
+                    if "distortion_params" in frame:
+                        dist = torch.tensor(frame["distortion_params"], dtype=torch.float32)
+                        if dist.shape[-1] >= 1:
+                            radial[i, 0] = dist[0].item()  # k1
+                        if dist.shape[-1] >= 2:
+                            radial[i, 1] = dist[1].item()  # k2
+                        if dist.shape[-1] >= 3:
+                            radial[i, 2] = dist[2].item()  # k3
+                        if dist.shape[-1] >= 4:
+                            radial[i, 3] = dist[3].item()  # k4
+                        if dist.shape[-1] >= 5:
+                            tangential[i, 0] = dist[4].item()  # p1
+                        if dist.shape[-1] >= 6:
+                            tangential[i, 1] = dist[5].item()  # p2
+        elif camera_type == CameraType.FISHEYE624:
+            # FISHEYE624: 12 parameters [k0...k5, p0, p1, s0...s3]
+            if distortion_params is not None and distortion_params.numel() > 0:
+                if distortion_params.dim() == 1:
+                    distortion_params = distortion_params.unsqueeze(0)
+                if distortion_params.shape[-1] >= 12:
+                    radial = distortion_params[..., :6]  # k0...k5
+                    tangential = distortion_params[..., 6:8]  # p0, p1
+                    thin_prism = distortion_params[..., 8:12]  # s0...s3
+                else:
+                    # Pad with zeros if fewer than 12 parameters
+                    batch_shape = distortion_params.shape[:-1]
+                    radial = torch.zeros((*batch_shape, 6), dtype=distortion_params.dtype, device=distortion_params.device)
+                    tangential = torch.zeros((*batch_shape, 2), dtype=distortion_params.dtype, device=distortion_params.device)
+                    thin_prism = torch.zeros((*batch_shape, 4), dtype=distortion_params.dtype, device=distortion_params.device)
+                    if distortion_params.shape[-1] >= 6:
+                        radial[..., :6] = distortion_params[..., :6]
+                    else:
+                        radial[..., :distortion_params.shape[-1]] = distortion_params[..., :distortion_params.shape[-1]]
+                    if distortion_params.shape[-1] >= 8:
+                        tangential[..., :2] = distortion_params[..., 6:8]
+                    if distortion_params.shape[-1] >= 12:
+                        thin_prism[..., :4] = distortion_params[..., 8:12]
+            else:
+                # No distortion params, create zero tensors
+                batch_shape = (len(indices),) if not distort_fixed else ()
+                radial = torch.zeros((*batch_shape, 6), dtype=torch.float32)
+                tangential = torch.zeros((*batch_shape, 2), dtype=torch.float32)
+                thin_prism = torch.zeros((*batch_shape, 4), dtype=torch.float32)
 
         # Only add fisheye crop radius parameter if the images are actually fisheye, to allow the same config to be used
         # for both fisheye and non-fisheye datasets.

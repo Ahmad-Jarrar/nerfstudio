@@ -21,11 +21,12 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import splines
 import splines.quaternion
+import torch
 import viser
 import viser.transforms as tf
 from scipy import interpolate
@@ -517,6 +518,32 @@ class RenderTabState:
     preview_time: float
     preview_aspect: float
     preview_camera_type: Literal["Perspective", "Fisheye", "Equirectangular"]
+    use_custom_intrinsics: bool = False
+    fx: Optional[float] = None
+    fy: Optional[float] = None
+    cx: Optional[float] = None
+    cy: Optional[float] = None
+    use_distortion: bool = False
+    # Perspective distortion parameters (12 total: 6 radial, 2 tangential, 4 thin prism)
+    k1: float = 0.0
+    k2: float = 0.0
+    k3: float = 0.0
+    k4: float = 0.0
+    k5: float = 0.0
+    k6: float = 0.0
+    p1: float = 0.0
+    p2: float = 0.0
+    s1: float = 0.0
+    s2: float = 0.0
+    s3: float = 0.0
+    s4: float = 0.0
+    # Fisheye distortion parameters (4 radial)
+    fisheye_k1: float = 0.0
+    fisheye_k2: float = 0.0
+    fisheye_k3: float = 0.0
+    fisheye_k4: float = 0.0
+    # UI element references for updating from camera clicks
+    _ui_elements: Optional[Dict[str, Any]] = None
 
 
 def populate_render_tab(
@@ -559,6 +586,426 @@ def populate_render_tab(
         def _(_) -> None:
             camera_path.default_render_time = render_time.value
 
+    resolution = server.gui.add_vector2(
+        "Resolution",
+        initial_value=(1920, 1080),
+        min=(50, 50),
+        max=(10_000, 10_000),
+        step=1,
+        hint="Render output resolution in pixels.",
+    )
+
+    # Camera intrinsics controls
+    use_custom_intrinsics = server.gui.add_checkbox(
+        "Use custom intrinsics",
+        initial_value=False,
+        hint="Override camera intrinsics with custom values",
+    )
+    
+    fx_number = server.gui.add_number(
+        "fx (focal length x)",
+        initial_value=0.0,
+        min=0.0,
+        max=100000.0,
+        step=1.0,
+        hint="Focal length in x direction (pixels)",
+        disabled=True,
+    )
+    fy_number = server.gui.add_number(
+        "fy (focal length y)",
+        initial_value=0.0,
+        min=0.0,
+        max=100000.0,
+        step=1.0,
+        hint="Focal length in y direction (pixels)",
+        disabled=True,
+    )
+    cx_number = server.gui.add_number(
+        "cx (principal point x)",
+        initial_value=0.0,
+        min=0.0,
+        max=100000.0,
+        step=1.0,
+        hint="Principal point x coordinate (pixels)",
+        disabled=True,
+    )
+    cy_number = server.gui.add_number(
+        "cy (principal point y)",
+        initial_value=0.0,
+        min=0.0,
+        max=100000.0,
+        step=1.0,
+        hint="Principal point y coordinate (pixels)",
+        disabled=True,
+    )
+
+    @use_custom_intrinsics.on_update
+    def _(_) -> None:
+        render_tab_state.use_custom_intrinsics = use_custom_intrinsics.value
+        fx_number.disabled = not use_custom_intrinsics.value
+        fy_number.disabled = not use_custom_intrinsics.value
+        cx_number.disabled = not use_custom_intrinsics.value
+        cy_number.disabled = not use_custom_intrinsics.value
+        if not use_custom_intrinsics.value:
+            _update_intrinsics_display()
+
+    @fx_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.fx = fx_number.value if use_custom_intrinsics.value else None
+        except (ValueError, TypeError):
+            # Handle partial input like '-' while typing
+            pass
+
+    @fy_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.fy = fy_number.value if use_custom_intrinsics.value else None
+        except (ValueError, TypeError):
+            pass
+
+    @cx_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.cx = cx_number.value if use_custom_intrinsics.value else None
+        except (ValueError, TypeError):
+            pass
+
+    @cy_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.cy = cy_number.value if use_custom_intrinsics.value else None
+        except (ValueError, TypeError):
+            pass
+
+    # Distortion parameters controls
+    use_distortion = server.gui.add_checkbox(
+        "Use distortion",
+        initial_value=False,
+        hint="Enable distortion parameters. Perspective: 6 radial (k1-k6), 2 tangential (p1, p2), 4 thin prism (s1-s4). Fisheye: 4 radial (k1-k4).",
+    )
+    
+    # Perspective distortion parameters
+    k1_number = server.gui.add_number(
+        "k1 (radial)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="First radial distortion coefficient",
+        disabled=True,
+    )
+    k2_number = server.gui.add_number(
+        "k2 (radial)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Second radial distortion coefficient",
+        disabled=True,
+    )
+    k3_number = server.gui.add_number(
+        "k3 (radial)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Third radial distortion coefficient",
+        disabled=True,
+    )
+    k4_number = server.gui.add_number(
+        "k4 (radial)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Fourth radial distortion coefficient",
+        disabled=True,
+    )
+    k5_number = server.gui.add_number(
+        "k5 (radial)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Fifth radial distortion coefficient",
+        disabled=True,
+    )
+    k6_number = server.gui.add_number(
+        "k6 (radial)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Sixth radial distortion coefficient",
+        disabled=True,
+    )
+    p1_number = server.gui.add_number(
+        "p1 (tangential)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="First tangential distortion coefficient",
+        disabled=True,
+    )
+    p2_number = server.gui.add_number(
+        "p2 (tangential)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Second tangential distortion coefficient",
+        disabled=True,
+    )
+    s1_number = server.gui.add_number(
+        "s1 (thin prism)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="First thin prism distortion coefficient",
+        disabled=True,
+    )
+    s2_number = server.gui.add_number(
+        "s2 (thin prism)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Second thin prism distortion coefficient",
+        disabled=True,
+    )
+    s3_number = server.gui.add_number(
+        "s3 (thin prism)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Third thin prism distortion coefficient",
+        disabled=True,
+    )
+    s4_number = server.gui.add_number(
+        "s4 (thin prism)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Fourth thin prism distortion coefficient",
+        disabled=True,
+    )
+    
+    # Fisheye distortion parameters
+    fisheye_k1_number = server.gui.add_number(
+        "k1 (radial)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="First radial distortion coefficient (fisheye)",
+        disabled=True,
+    )
+    fisheye_k2_number = server.gui.add_number(
+        "k2 (radial)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Second radial distortion coefficient (fisheye)",
+        disabled=True,
+    )
+    fisheye_k3_number = server.gui.add_number(
+        "k3 (radial)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Third radial distortion coefficient (fisheye)",
+        disabled=True,
+    )
+    fisheye_k4_number = server.gui.add_number(
+        "k4 (radial)",
+        initial_value=0.0,
+        min=-10.0,
+        max=10.0,
+        step=0.0001,
+        hint="Fourth radial distortion coefficient (fisheye)",
+        disabled=True,
+    )
+
+    def _update_distortion_visibility() -> None:
+        """Update visibility of distortion parameters based on camera type."""
+        is_perspective = camera_type.value == "Perspective"
+        is_fisheye = camera_type.value == "Fisheye"
+        enabled = use_distortion.value
+        
+        # Perspective parameters
+        k1_number.disabled = not (enabled and is_perspective)
+        k2_number.disabled = not (enabled and is_perspective)
+        k3_number.disabled = not (enabled and is_perspective)
+        k4_number.disabled = not (enabled and is_perspective)
+        k5_number.disabled = not (enabled and is_perspective)
+        k6_number.disabled = not (enabled and is_perspective)
+        p1_number.disabled = not (enabled and is_perspective)
+        p2_number.disabled = not (enabled and is_perspective)
+        s1_number.disabled = not (enabled and is_perspective)
+        s2_number.disabled = not (enabled and is_perspective)
+        s3_number.disabled = not (enabled and is_perspective)
+        s4_number.disabled = not (enabled and is_perspective)
+        
+        # Fisheye parameters
+        fisheye_k1_number.disabled = not (enabled and is_fisheye)
+        fisheye_k2_number.disabled = not (enabled and is_fisheye)
+        fisheye_k3_number.disabled = not (enabled and is_fisheye)
+        fisheye_k4_number.disabled = not (enabled and is_fisheye)
+
+    @use_distortion.on_update
+    def _(_) -> None:
+        render_tab_state.use_distortion = use_distortion.value
+        _update_distortion_visibility()
+
+    @k1_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.k1 = k1_number.value
+        except (ValueError, TypeError):
+            # Handle partial input like '-' while typing
+            pass
+
+    @k2_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.k2 = k2_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @k3_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.k3 = k3_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @k4_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.k4 = k4_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @k5_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.k5 = k5_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @k6_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.k6 = k6_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @p1_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.p1 = p1_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @p2_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.p2 = p2_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @s1_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.s1 = s1_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @s2_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.s2 = s2_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @s3_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.s3 = s3_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @s4_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.s4 = s4_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @fisheye_k1_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.fisheye_k1 = fisheye_k1_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @fisheye_k2_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.fisheye_k2 = fisheye_k2_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @fisheye_k3_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.fisheye_k3 = fisheye_k3_number.value
+        except (ValueError, TypeError):
+            pass
+
+    @fisheye_k4_number.on_update
+    def _(_) -> None:
+        try:
+            render_tab_state.fisheye_k4 = fisheye_k4_number.value
+        except (ValueError, TypeError):
+            pass
+
+    def _update_intrinsics_display() -> None:
+        """Update the intrinsics display values based on current camera state."""
+        if use_custom_intrinsics.value:
+            return  # Don't update if using custom values
+        
+        # Compute current intrinsics from FOV and aspect
+        fov_rad = fov_degrees.value / 180.0 * np.pi
+        aspect = resolution.value[0] / resolution.value[1] if resolution.value[1] > 0 else 1.0
+        ref_height = resolution.value[1] if resolution.value[1] > 0 else 1080
+        ref_width = int(ref_height * aspect)
+        pp_w = ref_width / 2.0
+        pp_h = ref_height / 2.0
+        focal_length = pp_h / np.tan(fov_rad / 2.0)
+        
+        # Update display values
+        fx_number.value = float(focal_length)
+        fy_number.value = float(focal_length)
+        cx_number.value = float(pp_w)
+        cy_number.value = float(pp_h)
+        
+        # Update render_tab_state with computed values
+        render_tab_state.fx = None
+        render_tab_state.fy = None
+        render_tab_state.cx = None
+        render_tab_state.cy = None
+
+    # Initialize intrinsics display
+    _update_intrinsics_display()
+
     @fov_degrees.on_update
     def _(_) -> None:
         fov_radians = fov_degrees.value / 180.0 * np.pi
@@ -570,20 +1017,14 @@ def populate_render_tab(
         # Could rethink this.
         camera_path.update_aspect(resolution.value[0] / resolution.value[1])
         compute_and_update_preview_camera_state()
-
-    resolution = server.gui.add_vector2(
-        "Resolution",
-        initial_value=(1920, 1080),
-        min=(50, 50),
-        max=(10_000, 10_000),
-        step=1,
-        hint="Render output resolution in pixels.",
-    )
+        # Update intrinsics display if not using custom values
+        _update_intrinsics_display()
 
     @resolution.on_update
     def _(_) -> None:
         camera_path.update_aspect(resolution.value[0] / resolution.value[1])
         compute_and_update_preview_camera_state()
+        _update_intrinsics_display()
 
     camera_type = server.gui.add_dropdown(
         "Camera type",
@@ -591,6 +1032,12 @@ def populate_render_tab(
         initial_value="Perspective",
         hint="Camera model to render with. This is applied to all keyframes.",
     )
+    
+    @camera_type.on_update
+    def _(_) -> None:
+        render_tab_state.preview_camera_type = camera_type.value
+        _update_distortion_visibility()
+    
     add_button = server.gui.add_button(
         "Add Keyframe",
         icon=viser.Icon.PLUS,
@@ -1179,6 +1626,34 @@ def populate_render_tab(
     camera_path.tension = tension_slider.value
     camera_path.default_fov = fov_degrees.value / 180.0 * np.pi
     camera_path.default_transition_sec = transition_sec_number.value
+
+    # Store UI element references for updating from camera clicks
+    render_tab_state._ui_elements = {
+        "fov_degrees": fov_degrees,
+        "use_custom_intrinsics": use_custom_intrinsics,
+        "fx_number": fx_number,
+        "fy_number": fy_number,
+        "cx_number": cx_number,
+        "cy_number": cy_number,
+        "use_distortion": use_distortion,
+        "camera_type": camera_type,
+        "k1_number": k1_number,
+        "k2_number": k2_number,
+        "k3_number": k3_number,
+        "k4_number": k4_number,
+        "k5_number": k5_number,
+        "k6_number": k6_number,
+        "p1_number": p1_number,
+        "p2_number": p2_number,
+        "s1_number": s1_number,
+        "s2_number": s2_number,
+        "s3_number": s3_number,
+        "s4_number": s4_number,
+        "fisheye_k1_number": fisheye_k1_number,
+        "fisheye_k2_number": fisheye_k2_number,
+        "fisheye_k3_number": fisheye_k3_number,
+        "fisheye_k4_number": fisheye_k4_number,
+    }
 
     return render_tab_state
 
